@@ -618,6 +618,26 @@ whole chain on every job, so you can inspect progress as it goes.
 and are refused with `chain_id` set - use `chain_id` empty for those, or
 turn them off.
 
+#### Testing it inside ComfyUI
+
+The node grows a small control panel the moment `chain_id` is non-empty:
+a read-only status line (`chain: N/M rendered, next shot N+1`, polled from
+`GET /h3multishot/chain_state?chain_id=...` - the same manifest an external
+caller like Framesmith would poll) and three buttons that set
+`resume_chain`/`shots_this_run`/`regenerate_from_shot` for you and queue the
+graph:
+
+- **▶ Next shot (clip-by-clip)** - renders exactly one more shot.
+- **⏩ Render rest (batch)** - renders every remaining shot in this one job.
+- **↺ Regenerate shot...** - asks which shot number to redo, discards its
+  saved state and everything after it, and renders it again. Change
+  `script` or `seed` first if you want a different take.
+
+`workflows/H3_Seamless_Chain_v2_clip_by_clip.json` is `H3_Seamless_Chain_v2`
+with `chain_id` pre-set to `test_chain` and `shots_this_run` at `1` - load
+it, click **▶ Next shot** repeatedly, and each queue renders exactly one
+shot of the chain instead of the whole thing.
+
 ### Remote text encoder (`H3 Remote Text Encoder`, optional)
 
 The text encoder works for a few seconds per shot and holds 15+ GB the whole
