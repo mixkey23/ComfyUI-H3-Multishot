@@ -556,6 +556,44 @@ if long chains have ever crashed your machine at the join step, or if you run
 under 32 GB of system RAM. The finished file's path is available on the new
 `master_path` output either way.
 
+### `chain_id` / `resume_chain` / `shots_this_run` - clip-by-clip resumable chains (memory sampler)
+
+`H3MultishotMemorySampler` normally renders a whole chain - every shot - in
+ONE ComfyUI job. Leave `chain_id` empty and nothing changes.
+
+Set `chain_id` to a name of your choosing to split a chain across MULTIPLE
+jobs instead - one per shot, or a few shots at a time - with the bank, the
+continuity pin, the colour/gain/audio-tone running state, and everything
+rendered so far saved to a
+`chain_multishot_<chain_id>.h3cache` file under
+`output/video/H3CHAIN_STATE/` after every job, and picked back up by the
+next one. This is the same idea as the Motion-Context pack's own disk-cached
+cross-job continuity, applied to the whole memory sampler rather than just
+the interior latent pin.
+
+- First job of a chain: `chain_id` set, `resume_chain` OFF. Renders from
+  shot 1.
+- Every later job: the SAME `chain_id`, `resume_chain` ON. Picks up from the
+  next unrendered shot.
+- `shots_this_run` caps how many shots render in one job - `0` renders every
+  remaining shot (still checkpointing after each one, so a crash only loses
+  the shot in flight); `1` is true clip-by-clip, one shot per job.
+
+`script`, `shot_count`, resolution, `frames_per_shot`, `seed`, and every
+continuity-affecting dial (`continuity`, `bank_pinned`, `memory_frames`,
+`chain_gain_control`, `pin_frames`, and the rest) must match exactly between
+jobs of the same chain - a resume against different settings is refused
+outright rather than silently rendering a chain whose continuity is wrong.
+
+`master_frames` / `master_audio` / `master_path` stay empty on every job
+except the one that renders the LAST shot, which joins everything staged so
+far (the same disk-streaming path `low_ram_master` uses) into the finished
+master. `shots_rendered` and the `LATENT` outputs are cumulative across the
+whole chain on every job, so you can inspect progress as it goes.
+`join_fx` and `color_level=scene` need the whole chain's pixels in one place
+and are refused with `chain_id` set - use `chain_id` empty for those, or
+turn them off.
+
 ### Remote text encoder (`H3 Remote Text Encoder`, optional)
 
 The text encoder works for a few seconds per shot and holds 15+ GB the whole

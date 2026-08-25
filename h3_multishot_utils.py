@@ -3176,6 +3176,111 @@ def _jb_audio_window(wav, sr, start_frame, num_frames, fps=24.0):
     return {"waveform": a[..., s:e].clone(), "sample_rate": int(sr)}
 
 
+def _h3_chain_cache_dir():
+    """Where clip-by-clip resumable chain state lives on disk.
+
+    Mirrors the ComfyUI_MiniMax_H3_Extender pack's own
+    chain_extender_<owner>.h3cache convention (a flat .h3cache file per
+    chain, in a dedicated output subfolder) so both packs' disk-cached
+    continuity state is easy to find in one place.
+    """
+    import os
+    import folder_paths as _fp
+    d = os.path.join(_fp.get_output_directory(), "video", "H3CHAIN_STATE")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _h3_chain_cache_path(chain_id):
+    import os
+    import re as _re
+    safe = _re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chain_id).strip())
+    if not safe:
+        raise ValueError("chain_id must contain at least one "
+                          "letter/digit/underscore/dash once sanitised.")
+    return os.path.join(_h3_chain_cache_dir(),
+                        "chain_multishot_%s.h3cache" % safe)
+
+
+def _h3_chain_config_fingerprint(**kw):
+    """Hash of every setting that the resumed continuity state depends on.
+
+    A resumed job that silently used different settings than the job that
+    produced the cached state would not crash - it would produce a chain
+    whose continuity is wrong in ways that are easy to miss until the join
+    is watched. Fail loudly on mismatch instead.
+    """
+    import hashlib
+    import json as _json
+    blob = _json.dumps(kw, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _h3_save_chain_state(path, state):
+    """Atomic write: a killed process must never leave a half-written cache
+    that the next job would load as if it were complete."""
+    import os
+    import torch
+    tmp = path + ".tmp_%d" % os.getpid()
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def _h3_load_chain_state(path):
+    import os
+    import torch
+    if not os.path.exists(path):
+        return None
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _h3_to_device(obj, device):
+    """Recursively move every tensor in a loaded chain-state value onto
+    `device`. _h3_load_chain_state() forces map_location='cpu' so a resume
+    never depends on the SAVING job's GPU still existing; this is the other
+    half - the loaded state has to land back on whatever device THIS job's
+    model actually runs on before anything downstream (which assumes its
+    inputs are already there, exactly as they always were within one job)
+    touches it."""
+    import torch
+    if torch.is_tensor(obj):
+        return obj.to(device) if obj.device != device else obj
+    if isinstance(obj, dict):
+        return {k: _h3_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_h3_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_h3_to_device(v, device) for v in obj)
+    return obj
+
+
+def _h3_make_stream_writer(fixed_dir, fps=24):
+    """A ShotStreamWriter pinned to a STABLE directory instead of a fresh
+    tempfile.mkdtemp() every call - resuming a chain across jobs needs the
+    next job to find the same staged shots the previous job wrote."""
+    import os
+    try:
+        from .h3_stream_master import ShotStreamWriter
+    except ImportError:
+        import importlib.util as _ilu
+        _sp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "h3_stream_master.py")
+        _spec = _ilu.spec_from_file_location("h3_stream_master", _sp)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        ShotStreamWriter = _mod.ShotStreamWriter
+    os.makedirs(fixed_dir, exist_ok=True)
+    w = ShotStreamWriter.__new__(ShotStreamWriter)
+    w.dir = fixed_dir
+    w.fps = float(fps)
+    w.shots = []
+    w.luma = []
+    w.std = []
+    w.pending = None
+    w._finalized = False
+    return w
+
+
 class _H3ChainBank:
     """Bounded frame bank: pinned earliest entries + recency tail.
 
@@ -3791,6 +3896,50 @@ class H3MultishotMemorySampler:
                            "the source, before it ever enters the pin. Too "
                            "high reads as waxy shimmer; start at 0.02-0.05. "
                            "0 = off."}),
+            # APPENDED LAST: clip-by-clip resumable chaining. Leave chain_id
+            # empty and every input above behaves exactly as before - this is
+            # opt-in. Set it to render ONE job per shot instead of the whole
+            # chain in one job: the bank, the continuity pin, the colour/gain/
+            # audio-tone running state and the accumulated output are saved to
+            # a chain_multishot_<chain_id>.h3cache file after each job and
+            # picked back up by the next, mirroring the Motion-Context pack's
+            # own disk-cached cross-job continuity.
+            "chain_id": ("STRING", {
+                "default": "",
+                "tooltip": "Empty (default) = normal single-job behaviour, "
+                           "unchanged. Non-empty = this chain's continuity "
+                           "state is saved to disk after every job under "
+                           "output/video/H3CHAIN_STATE/ and can be resumed "
+                           "by a LATER job (resume_chain=True) with the SAME "
+                           "chain_id - one ComfyUI job per shot instead of "
+                           "the whole chain in one. script, shot_count, "
+                           "width, height, frames_per_shot, seed, and every "
+                           "continuity-affecting setting must match exactly "
+                           "between jobs of the same chain, or the resume is "
+                           "refused rather than silently rendered wrong."}),
+            "resume_chain": ("BOOLEAN", {
+                "default": False, "label_on": "resume saved chain state",
+                "label_off": "start fresh (shot 1)",
+                "tooltip": "With chain_id set: OFF starts a new chain at "
+                           "shot 1 (refused if that chain_id already has "
+                           "saved state, to avoid silently clobbering an "
+                           "in-progress chain - use a new chain_id or turn "
+                           "this on). ON loads the saved bank/pin/colour/"
+                           "gain state and continues from the next "
+                           "unrendered shot. Ignored when chain_id is "
+                           "empty."}),
+            "shots_this_run": ("INT", {
+                "default": 0, "min": 0, "max": 64,
+                "tooltip": "With chain_id set: how many shots to render in "
+                           "THIS job before saving state and returning - 0 "
+                           "(default) renders every remaining shot in one "
+                           "job (same as chain_id off, but still checkpoints "
+                           "to disk after each shot for crash recovery). 1 = "
+                           "true clip-by-clip: one shot per job. The master "
+                           "outputs stay empty/partial until the job that "
+                           "renders the LAST shot, which joins everything "
+                           "accumulated so far and returns the finished "
+                           "chain. Ignored when chain_id is empty."}),
         },
             # hidden inputs are not widgets, so saved workflows are unaffected
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
@@ -3803,7 +3952,9 @@ class H3MultishotMemorySampler:
     OUTPUT_TOOLTIPS = (
         "The joined master, seams trimmed.",
         "Master audio.",
-        "How many shots rendered.",
+        "How many shots rendered. With chain_id set, this is cumulative "
+        "across every job of the chain so far, not just this job's own "
+        "shots_this_run.",
         "Every shot's video latent EXACTLY as sampled, batched along dim 0 "
         "(one entry per shot), UNTRIMMED. Shots after the first open with "
         "head_frames of replayed material from the previous shot's tail - "
@@ -3815,8 +3966,10 @@ class H3MultishotMemorySampler:
         "Frames of replayed head carried by every shot AFTER the first "
         "(0 for shot 1, and 0 for continuity modes that do not pin). Trim "
         "this many frames off the front of each later shot after you decode.",
-        "low_ram_master only: the finished master file on disk. Empty string "
-        "when low_ram_master is off (use master_frames as always).")
+        "low_ram_master, or chain_id on the job that renders the LAST shot: "
+        "the finished master file on disk. Empty string when low_ram_master "
+        "is off (use master_frames as always), and empty on every chain_id "
+        "job before the last one (the chain is not finished yet).")
     FUNCTION = "run"
     CATEGORY = "sampling/minimax"
 
@@ -3864,6 +4017,7 @@ class H3MultishotMemorySampler:
             low_ram_master=False, audio_pin_frames=0,
             pin_noise_audio=False, audio_tone_control=False,
             x0_texture_clamp=0.0,
+            chain_id="", resume_chain=False, shots_this_run=0,
             prompt=None, extra_pnginfo=None):
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
@@ -3901,6 +4055,86 @@ class H3MultishotMemorySampler:
             shots = shots[:n]
         while len(shots) < n:
             shots.append(shots[-1])
+
+        # --- clip-by-clip resumable chaining: fail fast, before any of this
+        # job's GPU work, if the chain_id/resume_chain combination cannot be
+        # honoured. Silent misuse here (a clobbered in-progress chain, or a
+        # resume against different settings) does not crash - it produces a
+        # chain whose continuity is subtly wrong, discovered only on watch.
+        chain_id = str(chain_id or "").strip()
+        _chain_cache_path = None
+        _chain_saved = None
+        _chain_start_si = 0
+        if chain_id:
+            _chain_cache_path = _h3_chain_cache_path(chain_id)
+            _chain_cfg_fp = _h3_chain_config_fingerprint(
+                script=script, shot_count=shot_count, width=width,
+                height=height, frames_per_shot=frames_per_shot, seed=seed,
+                seed_per_shot=seed_per_shot, memory_frames=memory_frames,
+                anchor_frames=anchor_frames, bank_pinned=bank_pinned,
+                chain_gain_control=chain_gain_control,
+                bank_clip_frames=bank_clip_frames, continuity=continuity,
+                color_level=color_level, pin_frames=pin_frames,
+                pin_noise=pin_noise, pin_renorm=pin_renorm,
+                audio_pin_frames=audio_pin_frames,
+                pin_noise_audio=pin_noise_audio,
+                handoff_release=handoff_release,
+                handoff_depth=handoff_depth, handoff_taper=handoff_taper,
+                audio_lock=audio_lock, join_blend=join_blend,
+                join_fx=join_fx, join_anchor_noise=join_anchor_noise,
+                bank_ref_noise=bank_ref_noise, end_anchor=end_anchor,
+                audio_tone_control=audio_tone_control,
+                x0_texture_clamp=x0_texture_clamp,
+                self_anchor_voice=self_anchor_voice,
+                reference_subjects=reference_subjects, n_total=n)
+            import os as _os_cc
+            if resume_chain:
+                _chain_saved = _h3_load_chain_state(_chain_cache_path)
+                if _chain_saved is None:
+                    raise ValueError(
+                        "resume_chain=True but chain_id=%r has no saved "
+                        "state at %s. Render shot 1 first with "
+                        "resume_chain=False, then resume after."
+                        % (chain_id, _chain_cache_path))
+                if _chain_saved.get("config_fp") != _chain_cfg_fp:
+                    raise ValueError(
+                        "chain_id=%r's saved state was produced with "
+                        "different settings (script/shot_count/resolution/"
+                        "frames_per_shot/continuity/bank config, or any "
+                        "other continuity-affecting input changed between "
+                        "jobs). Resuming would silently render a chain "
+                        "whose continuity is wrong. Match the original "
+                        "job's settings exactly, or start a new chain_id."
+                        % chain_id)
+                _chain_start_si = int(_chain_saved["next_shot"])
+                if _chain_start_si >= n:
+                    raise ValueError(
+                        "chain_id=%r already rendered all %d shot(s). Use a "
+                        "new chain_id to start another chain."
+                        % (chain_id, n))
+                # loaded on CPU (map_location='cpu'); land the tensors that
+                # actually feed sampling back on the model's own device,
+                # same as they always were within a single job. audio_parts/
+                # lat_v_parts/lat_a_parts/stream_* stay on CPU exactly as the
+                # normal per-job path already keeps them (moving those to
+                # GPU too would pile every past shot's latents into VRAM
+                # right where a long chain can least afford it).
+                _cp_dev = _mm.get_torch_device()
+                for _k in ("bank_entries", "cp_prev", "cc_mu", "cc_cov",
+                          "rp_ref", "at_house", "cg_ref", "cg_last_raw",
+                          "pin_sig0", "pin_hf0", "last_tail", "ho_v", "ho_a",
+                          "ho_taper_src", "ho_guard", "ho_wav_tail",
+                          "house_frame", "voice_block"):
+                    if _k in _chain_saved:
+                        _chain_saved[_k] = _h3_to_device(
+                            _chain_saved[_k], _cp_dev)
+            elif _os_cc.path.exists(_chain_cache_path):
+                raise ValueError(
+                    "chain_id=%r already has saved state at %s, and "
+                    "resume_chain=False would silently overwrite an "
+                    "in-progress chain. Set resume_chain=True to continue "
+                    "it, or pick a new chain_id." % (chain_id,
+                                                      _chain_cache_path))
 
         if sigmas is not None and len(sigmas) > 1:
             # a supplied schedule wins: some turbo LoRAs only converge on the
@@ -4085,6 +4319,37 @@ class H3MultishotMemorySampler:
                     print("[H3Memory] low_ram_master unavailable (%s) - "
                           "using the RAM path." % _e, flush=True)
                     _stream_writer = None
+
+        # ---- chain_id: clip-by-clip runs are FORCED onto the disk-streaming
+        # path regardless of low_ram_master, because the RAM path's frames_
+        # parts/master pixels cannot survive a job boundary. Unlike
+        # low_ram_master's own fallback above, an unstreamable combination
+        # here is a hard error: silently falling back to RAM would produce a
+        # chain that looks fine job-to-job and is simply never joined.
+        if chain_id and _stream_writer is None:
+            import os
+            import re as _re_cc
+            _c_blockers = []
+            if str(join_fx or "off") not in ("off", "none", ""):
+                _c_blockers.append("join_fx")
+            if str(color_level or "") == "scene":
+                _c_blockers.append("color_level=scene")
+            if _c_blockers:
+                raise ValueError(
+                    "chain_id=%r cannot run clip-by-clip with %s set: %s "
+                    "read pixels across the WHOLE chain at the end, which "
+                    "does not exist yet in a partial job. Turn %s off, or "
+                    "render this chain in one job (chain_id empty)."
+                    % (chain_id, "+".join(_c_blockers),
+                       "+".join(_c_blockers), "+".join(_c_blockers)))
+            _chain_stream_dir = os.path.join(
+                _h3_chain_cache_dir(),
+                "stream_%s" % _re_cc.sub(r"[^A-Za-z0-9_.-]+", "_", chain_id))
+            _stream_writer = _h3_make_stream_writer(_chain_stream_dir, fps=24)
+            print("[H3Memory] chain_id=%r: shots stage to %s across jobs; "
+                  "the LAST shot's job joins everything staged so far into "
+                  "the finished master." % (chain_id, _chain_stream_dir),
+                  flush=True)
 
         _lat_v_parts, _lat_a_parts = [], []   # issue #12: raw per-shot latents
         upscale_model = None
@@ -4283,7 +4548,94 @@ class H3MultishotMemorySampler:
               f"slot(s), {_jb_grid(bank_clip_frames)}f clips. Needs a ref2va "
               f"checkpoint.", flush=True)
 
-        for si, prompt in enumerate(shots):
+        # --- clip-by-clip resumable chaining: overwrite the fresh state
+        # above with whatever the PREVIOUS job for this chain_id saved, so
+        # this job's shot loop picks up exactly where that one left off.
+        if _chain_saved is not None:
+            bank._entries = _chain_saved["bank_entries"]
+            bank.num_fix = int(_chain_saved.get("bank_num_fix", bank.num_fix))
+            bank.max_size = int(_chain_saved.get("bank_max_size",
+                                                  bank.max_size))
+            _cp_prev = _chain_saved.get("cp_prev")
+            _cc_mu = _chain_saved.get("cc_mu")
+            _cc_cov = _chain_saved.get("cc_cov")
+            _rp_gain = _chain_saved.get("rp_gain", _rp_gain)
+            _rp_div_last = _chain_saved.get("rp_div_last", _rp_div_last)
+            _rp_ref = _chain_saved.get("rp_ref", _rp_ref)
+            _at_house = _chain_saved.get("at_house")
+            _cg_ref = _chain_saved.get("cg_ref")
+            _cg_last_raw = _chain_saved.get("cg_last_raw")
+            _pin_sig0 = _chain_saved.get("pin_sig0")
+            _pin_hf0 = _chain_saved.get("pin_hf0")
+            _cp_trim = _chain_saved.get("cp_trim", 0)
+            last_tail = _chain_saved.get("last_tail")
+            _ho_v = _chain_saved.get("ho_v")
+            _ho_a = _chain_saved.get("ho_a")
+            _ho_taper_src = _chain_saved.get("ho_taper_src")
+            _ho_guard = _chain_saved.get("ho_guard")
+            _ho_wav_tail = _chain_saved.get("ho_wav_tail")
+            _house_frame = _chain_saved.get("house_frame")
+            sr = _chain_saved.get("sr", sr)
+            if voice_block is None:
+                voice_block = _chain_saved.get("voice_block")
+            audio_parts = list(_chain_saved.get("audio_parts") or [])
+            _lat_v_parts = list(_chain_saved.get("lat_v_parts") or [])
+            _lat_a_parts = list(_chain_saved.get("lat_a_parts") or [])
+            if _stream_writer is not None:
+                _stream_writer.shots = list(
+                    _chain_saved.get("stream_shots") or [])
+                _stream_writer.luma = list(
+                    _chain_saved.get("stream_luma") or [])
+                _stream_writer.std = list(
+                    _chain_saved.get("stream_std") or [])
+                _stream_writer.pending = _chain_saved.get("stream_pending")
+            print("[H3Memory] chain_id=%r resumed: shot %d/%d next, bank %s"
+                  % (chain_id, _chain_start_si + 1, n, bank.describe()),
+                  flush=True)
+
+        _chain_shots_target = (n if not chain_id or int(shots_this_run) <= 0
+                               else min(n, _chain_start_si
+                                        + int(shots_this_run)))
+        _chain_last_si_done = _chain_start_si - 1
+        _chain_paused = False
+
+        def _chain_snapshot(next_shot):
+            # a closure, not a copy: every name below is read fresh out of
+            # run()'s own locals at CALL time, so it always reflects the
+            # state as of whichever shot just finished.
+            return {
+                "config_fp": _chain_cfg_fp,
+                "next_shot": next_shot,
+                "bank_entries": bank._entries,
+                "bank_num_fix": bank.num_fix,
+                "bank_max_size": bank.max_size,
+                "cp_prev": _cp_prev,
+                "cc_mu": _cc_mu, "cc_cov": _cc_cov,
+                "rp_gain": _rp_gain, "rp_div_last": _rp_div_last,
+                "rp_ref": _rp_ref,
+                "at_house": _at_house,
+                "cg_ref": _cg_ref, "cg_last_raw": _cg_last_raw,
+                "pin_sig0": _pin_sig0, "pin_hf0": _pin_hf0,
+                "cp_trim": _cp_trim,
+                "last_tail": last_tail,
+                "ho_v": _ho_v, "ho_a": _ho_a, "ho_taper_src": _ho_taper_src,
+                "ho_guard": _ho_guard, "ho_wav_tail": _ho_wav_tail,
+                "house_frame": _house_frame,
+                "sr": sr,
+                "voice_block": voice_block,
+                "audio_parts": audio_parts,
+                "lat_v_parts": _lat_v_parts, "lat_a_parts": _lat_a_parts,
+                "stream_shots": (_stream_writer.shots
+                                if _stream_writer else None),
+                "stream_luma": (_stream_writer.luma
+                               if _stream_writer else None),
+                "stream_std": (_stream_writer.std
+                              if _stream_writer else None),
+                "stream_pending": (_stream_writer.pending
+                                  if _stream_writer else None),
+            }
+
+        for si, prompt in list(enumerate(shots))[_chain_start_si:]:
             if two_pass_upscale:
                 latent, frame_count = mmh3._empty_av_latent(
                     _tp_w1, _tp_h1, frames_per_shot)
@@ -5763,6 +6115,57 @@ class H3MultishotMemorySampler:
             else:
                 frames_parts.append(imgs.cpu().half())
             audio_parts.append((wav if wav.ndim == 3 else wav.unsqueeze(0)).cpu())
+
+            if chain_id:
+                _chain_last_si_done = si
+                if si + 1 < n and si + 1 >= _chain_shots_target:
+                    _h3_save_chain_state(_chain_cache_path,
+                                         _chain_snapshot(si + 1))
+                    print("[H3Memory] chain_id=%r checkpointed after shot "
+                          "%d/%d -> %s" % (chain_id, si + 1, n,
+                                           _chain_cache_path), flush=True)
+                    _chain_paused = True
+                    break
+
+        if chain_id and _chain_paused:
+            # This job's quota is done but the chain is not - state is saved,
+            # the next job (resume_chain=True, same chain_id) continues it.
+            # Master outputs stay partial/empty; shots_rendered and the
+            # latents are cumulative across every job so far.
+            import torch as _t_pc
+            _rendered = _chain_last_si_done + 1
+            if audio_parts:
+                _p_wave = _xfade_audio(audio_parts, sr, ms=40)
+            else:
+                _p_wave = _t_pc.zeros((1, 2, 1))
+            if _stream_writer is not None and _stream_writer.shots:
+                _ph_h = _stream_writer.shots[-1]["h"]
+                _ph_w = _stream_writer.shots[-1]["w"]
+            else:
+                _ph_h = _ph_w = 64
+            _ph = _t_pc.zeros((1, _ph_h, _ph_w, 3), dtype=_t_pc.half)
+
+            def _chain_batch(parts):
+                if not parts:
+                    return {"samples": _t_pc.zeros(0)}
+                shapes = {tuple(x.shape[1:]) for x in parts}
+                if len(shapes) > 1:
+                    return {"samples": parts[0]}
+                return {"samples": _t_pc.cat(parts, dim=0)}
+
+            print("[H3Memory] chain_id=%r paused: %d/%d shot(s) rendered so "
+                  "far. Run again with resume_chain=True (same chain_id) to "
+                  "continue; the last shot's job returns the finished "
+                  "master." % (chain_id, _rendered, n), flush=True)
+            return (_ph, {"waveform": _p_wave, "sample_rate": sr}, _rendered,
+                    _chain_batch(_lat_v_parts), _chain_batch(_lat_a_parts),
+                    int(_cp_trim), "")
+
+        if chain_id:
+            # the chain finished IN THIS JOB: mark it complete so a stray
+            # future resume_chain=True gets "already rendered all shots"
+            # instead of silently starting over.
+            _h3_save_chain_state(_chain_cache_path, _chain_snapshot(n))
 
         if color_level == "scene" and len(frames_parts) > 1:
             # SCENE-WIDE match: ONE reference for the whole piece, applied
