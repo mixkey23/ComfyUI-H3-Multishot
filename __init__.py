@@ -42,6 +42,7 @@ for _m in ("h3_keyframes",       # keyframe anchors
            "rift_writer_unload",  # adds a free-VRAM switch to the writer
            "h3_remote_encode",   # CLIP-over-LAN + the /encode server route
            "h3_multishot_chain_api",  # /chain_state route for clip-by-clip UI
+           "h3_multishot_extender",  # H3MultishotExtender: single-node Extender-style front end
            "h3_tae_decode",     # 9 MB draft decode for seed hunts
            "h3_speed_boosters",  # switch panel for optional accelerators
            "h3_extend",          # H3ExtendTake: windows from a take length

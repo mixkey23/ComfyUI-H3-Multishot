@@ -638,6 +638,39 @@ with `chain_id` pre-set to `test_chain` and `shots_this_run` at `1` - load
 it, click **▶ Next shot** repeatedly, and each queue renders exactly one
 shot of the chain instead of the whole thing.
 
+### `H3MultishotExtender` - single-node, Extender-pack-style front end
+
+`H3MultishotMemorySampler` with `chain_id` is built for an EXTERNAL caller
+(Framesmith, or a script) deciding batch vs. clip-by-clip and driving each
+job. `H3MultishotExtender` is the other shape: ONE node, dropped in a graph
+and re-queued by hand, with a single `validated` toggle instead of four
+chain widgets - the same shape as the Motion-Context Extender pack's own
+`MiniMaxH3Extender` node. It is a thin wrapper: same engine, same disk
+cache, same continuity dials, just a different front door.
+
+- **`validated` OFF** (default): render the current shot as an unconfirmed
+  CANDIDATE. Its frames/audio come back on `master_frames`/`master_audio`
+  for review. Queueing again with OFF still set discards that candidate and
+  renders a new one for the SAME shot - change `script` or `seed` first for
+  a different take.
+- **`validated` ON**: lock in the current candidate - no re-render - and
+  advance. If nothing was rendered yet for this shot, ON renders it and
+  locks it in immediately (same as OFF then ON without looking).
+- Once every shot is locked in, `master_frames`/`master_audio`/`master_path`
+  are the finished, joined chain, exactly like `H3MultishotMemorySampler`'s
+  own chain_id path - and queueing again just returns that same result.
+- Chain identity defaults to this NODE (its ComfyUI id) - drop it, re-queue
+  it, no bookkeeping needed. Set `chain_id_override` for a stable id
+  independent of node numbering (useful when a caller submits fresh API
+  prompts rather than reusing one saved graph).
+- The `status` output and the node's status line spell out what just
+  happened: which shot, candidate or confirmed, how many remain.
+
+`workflows/H3_Multishot_Extender_test.json` has this node wired the same way
+`H3_Seamless_Chain_v2` wires `H3MultishotMemorySampler` (same model/CLIP/VAE
+links, same test script), `chain_id_override` pre-set to `test_extender`.
+Load it, toggle `validated`, queue, repeat.
+
 ### Remote text encoder (`H3 Remote Text Encoder`, optional)
 
 The text encoder works for a few seconds per shot and holds 15+ GB the whole

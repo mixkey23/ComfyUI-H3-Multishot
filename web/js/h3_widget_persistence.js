@@ -28,10 +28,21 @@
 import { app } from "../../scripts/app.js";
 
 const PROP = "h3_widget_values";
-const NODES = new Set([
+// LEGACY_REPAIR_NODES: the two sampler classes repairLegacyLayout() below
+// knows how to fix (its splice index is hardcoded to THEIR pre-v1.2
+// history) - do not add a node here unless its widget layout actually
+// shares that history, or the repair will misfire on an unrelated widget.
+const LEGACY_REPAIR_NODES = new Set([
     "H3MultishotMemorySampler",
     "H3MultishotSampler",
+]);
+// PERSISTENCE_NODES: every node that gets the name-keyed onSerialize/
+// onConfigure shadow copy below. Safe to add to freely - unlike the legacy
+// repair, this makes no assumption about widget order.
+const PERSISTENCE_NODES = new Set([
+    ...LEGACY_REPAIR_NODES,
     "H3StudioSwitches",
+    "H3MultishotExtender",
 ]);
 
 // H3StudioSwitches, 2.6.0: four flags that drove nothing in any shipped
@@ -77,7 +88,7 @@ app.registerExtension({
         let n = 0, s = 0;
         for (const node of graphData?.nodes ?? []) {
             if (node?.type === "H3StudioSwitches") { if (repairSwitchesLayout(node)) s++; continue; }
-            if (NODES.has(node?.type) && repairLegacyLayout(node)) n++;
+            if (LEGACY_REPAIR_NODES.has(node?.type) && repairLegacyLayout(node)) n++;
         }
         if (s) {
             console.warn(`[H3-Multishot] mapped ${s} VRAM/SPEED switches panel(s) from the pre-2.6 layout by name (four unused flags removed).`);
@@ -92,7 +103,7 @@ app.registerExtension({
     },
 
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (!NODES.has(nodeData?.name)) return;
+        if (!PERSISTENCE_NODES.has(nodeData?.name)) return;
 
         const origSerialize = nodeType.prototype.onSerialize;
         nodeType.prototype.onSerialize = function (o) {

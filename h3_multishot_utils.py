@@ -3227,6 +3227,17 @@ def _h3_chain_step_path(chain_id, shot_index):
                         "step_%04d.h3state" % int(shot_index))
 
 
+def _h3_chain_candidate_path(chain_id, shot_index):
+    """An UNCONFIRMED render of one shot - the Extender-style node's preview
+    step. Same shape as a step file (a full _chain_snapshot), but not yet
+    promoted: next_shot in the manifest still points at this same index
+    until something explicitly confirms it, so a plain resume/re-render
+    always retries THIS shot rather than moving on."""
+    import os
+    return os.path.join(_h3_chain_step_dir(chain_id),
+                        "candidate_%04d.h3state" % int(shot_index))
+
+
 def _h3_chain_stream_dir(chain_id):
     import os
     return os.path.join(_h3_chain_cache_dir(),
@@ -3260,16 +3271,17 @@ def _h3_prune_chain_tail(chain_id, keep_max_index):
     import os
     import glob as _glob
     step_dir = _h3_chain_step_dir(chain_id)
-    for p in _glob.glob(os.path.join(step_dir, "step_*.h3state")):
-        try:
-            idx = int(os.path.basename(p)[len("step_"):-len(".h3state")])
-        except ValueError:
-            continue
-        if idx > keep_max_index:
+    for prefix, suffix in (("step_", ".h3state"), ("candidate_", ".h3state")):
+        for p in _glob.glob(os.path.join(step_dir, prefix + "*" + suffix)):
             try:
-                os.remove(p)
-            except OSError:
-                pass
+                idx = int(os.path.basename(p)[len(prefix):-len(suffix)])
+            except ValueError:
+                continue
+            if idx > keep_max_index:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
     stream_dir = _h3_chain_stream_dir(chain_id)
     for p in _glob.glob(os.path.join(stream_dir, "shot_*.mkv")):
         try:
@@ -4128,6 +4140,17 @@ class H3MultishotMemorySampler:
             x0_texture_clamp=0.0,
             chain_id="", resume_chain=False, shots_this_run=0,
             regenerate_from_shot=0,
+            # INTERNAL ONLY - not in INPUT_TYPES, never set by a ComfyUI
+            # graph. H3MultishotExtender (a thin wrapper node around this
+            # same engine) passes these to get single-shot preview/confirm
+            # semantics instead of chain_id's render-and-lock-in-immediately
+            # default. _h3_candidate=True: render exactly one shot as an
+            # UNCONFIRMED candidate (does not advance the chain, returns the
+            # shot's own frames/audio as a preview instead of the usual
+            # placeholder). _h3_candidate_confirm=True: if a candidate
+            # already exists for the next shot, promote it (no re-sampling)
+            # instead of rendering.
+            _h3_candidate=False, _h3_candidate_confirm=False,
             prompt=None, extra_pnginfo=None):
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
@@ -4188,6 +4211,7 @@ class H3MultishotMemorySampler:
         _chain_saved = None
         _chain_start_si = 0
         _chain_rewinding = False
+        _chain_promoted_only = False
         if chain_id:
             _chain_manifest_path = _h3_chain_manifest_path(chain_id)
             # script/seed/seed_per_shot are DELIBERATELY not fingerprinted:
@@ -4257,6 +4281,42 @@ class H3MultishotMemorySampler:
                             "Use a new chain_id to start another chain, or "
                             "set regenerate_from_shot to redo one."
                             % (chain_id, n))
+                if _h3_candidate_confirm and _regen == 0:
+                    # Extender-style confirm: if the shot we are about to
+                    # work on already has an UNCONFIRMED candidate on disk
+                    # (a previous _h3_candidate=True call), promote it
+                    # in-place - no re-sampling. Bumping _chain_start_si
+                    # here means the ordinary "load the previous shot's
+                    # confirmed state" step right below transparently loads
+                    # the state we just promoted, and the render loop
+                    # further down naturally has one fewer shot to do.
+                    _cand_path = _h3_chain_candidate_path(chain_id,
+                                                          _chain_start_si)
+                    _cand = _h3_load_chain_state(_cand_path)
+                    if _cand is not None:
+                        _h3_prune_chain_tail(chain_id, _chain_start_si - 1)
+                        _h3_save_chain_state(
+                            _h3_chain_step_path(chain_id, _chain_start_si),
+                            _cand)
+                        try:
+                            import os as _os_promote
+                            _os_promote.remove(_cand_path)
+                        except OSError:
+                            pass
+                        _h3_write_manifest_atomic(_chain_manifest_path, {
+                            "format": "h3_multishot_chain_manifest_v1",
+                            "chain_id": chain_id, "config_fp": _chain_cfg_fp,
+                            "n_total": n, "next_shot": _chain_start_si + 1,
+                            "complete": (_chain_start_si + 1 >= n),
+                            "stream_dir": _h3_chain_stream_dir(chain_id),
+                            "created_at": _chain_manifest.get("created_at"),
+                            "updated_at": __import__("time").time(),
+                        })
+                        print("[H3Memory] chain_id=%r: shot %d confirmed "
+                              "from its candidate - no re-render."
+                              % (chain_id, _chain_start_si + 1), flush=True)
+                        _chain_start_si += 1
+                        _chain_promoted_only = True
                 if _chain_start_si > 0:
                     _chain_saved = _h3_load_chain_state(
                         _h3_chain_step_path(chain_id, _chain_start_si - 1))
@@ -4769,7 +4829,19 @@ class H3MultishotMemorySampler:
                                else min(n, _chain_start_si
                                         + int(shots_this_run)))
         _chain_last_si_done = _chain_start_si - 1
-        _chain_paused = False
+        # A promote-only call (confirmed a candidate, nothing new to render)
+        # has already done everything this call's budget allows: skip the
+        # render loop entirely (empty iterable, not a restructured loop) and
+        # go straight to the same partial-return the shots_this_run pause
+        # uses, UNLESS that promotion happened to finish the chain - then
+        # there is nothing left to pause on and the loop's natural zero
+        # iterations fall through to the normal full-chain finalize below,
+        # using the state the promotion already loaded.
+        _chain_paused = bool(_chain_promoted_only and _chain_start_si < n)
+        _chain_iter_shots = ([] if _chain_paused else
+                             list(enumerate(shots))[_chain_start_si:])
+        _chain_candidate_preview = None   # set inside the loop when
+                                          # _h3_candidate renders one
 
         def _chain_snapshot(next_shot):
             # a closure, not a copy: every name below is read fresh out of
@@ -4807,7 +4879,7 @@ class H3MultishotMemorySampler:
                                   if _stream_writer else None),
             }
 
-        for si, prompt in list(enumerate(shots))[_chain_start_si:]:
+        for si, prompt in _chain_iter_shots:
             if two_pass_upscale:
                 latent, frame_count = mmh3._empty_av_latent(
                     _tp_w1, _tp_h1, frames_per_shot)
@@ -6290,6 +6362,34 @@ class H3MultishotMemorySampler:
 
             if chain_id:
                 _chain_last_si_done = si
+                if _h3_candidate:
+                    # Extender-style preview: this shot's render is NOT
+                    # confirmed - save it as a candidate (next_shot stays
+                    # put, so a plain retry re-renders this SAME index) and
+                    # hand back the shot's own frames/audio as a preview
+                    # instead of the usual placeholder. Always exactly one
+                    # shot per call, regardless of shots_this_run.
+                    _h3_save_chain_state(
+                        _h3_chain_candidate_path(chain_id, si),
+                        _chain_snapshot(si + 1))
+                    _chain_candidate_preview = (imgs.cpu(), wav.cpu(),
+                                                float(sr))
+                    _h3_write_manifest_atomic(_chain_manifest_path, {
+                        "format": "h3_multishot_chain_manifest_v1",
+                        "chain_id": chain_id, "config_fp": _chain_cfg_fp,
+                        "n_total": n, "next_shot": si, "complete": False,
+                        "pending_candidate": si + 1,
+                        "stream_dir": _h3_chain_stream_dir(chain_id),
+                        "created_at": (_chain_manifest or {}).get(
+                            "created_at", __import__("time").time()),
+                        "updated_at": __import__("time").time(),
+                    })
+                    print("[H3Memory] chain_id=%r: shot %d rendered as a "
+                          "CANDIDATE - confirm it (validated=True) or "
+                          "re-render to try again." % (chain_id, si + 1),
+                          flush=True)
+                    _chain_paused = True
+                    break
                 # A step file per COMPLETED shot, not one file for the whole
                 # chain: this is what lets a LATER job rewind to "state as
                 # of finishing shot si" even after the chain has moved past
@@ -6324,6 +6424,27 @@ class H3MultishotMemorySampler:
             # latents are cumulative across every job so far.
             import torch as _t_pc
             _rendered = _chain_last_si_done + 1
+
+            def _chain_batch(parts):
+                if not parts:
+                    return {"samples": _t_pc.zeros(0)}
+                shapes = {tuple(x.shape[1:]) for x in parts}
+                if len(shapes) > 1:
+                    return {"samples": parts[0]}
+                return {"samples": _t_pc.cat(parts, dim=0)}
+
+            if _chain_candidate_preview is not None:
+                # Extender-style candidate: hand back the shot's OWN frames/
+                # audio, not a placeholder - this render has not been
+                # confirmed yet and the point is to look at it.
+                _cimgs, _cwav, _csr = _chain_candidate_preview
+                print("[H3Memory] chain_id=%r: candidate for shot %d ready "
+                      "for review." % (chain_id, _rendered), flush=True)
+                return (_cimgs.half(), {"waveform": _cwav,
+                                        "sample_rate": _csr}, _rendered,
+                        _chain_batch(_lat_v_parts), _chain_batch(_lat_a_parts),
+                        int(_cp_trim), "")
+
             if audio_parts:
                 _p_wave = _xfade_audio(audio_parts, sr, ms=40)
             else:
@@ -6334,14 +6455,6 @@ class H3MultishotMemorySampler:
             else:
                 _ph_h = _ph_w = 64
             _ph = _t_pc.zeros((1, _ph_h, _ph_w, 3), dtype=_t_pc.half)
-
-            def _chain_batch(parts):
-                if not parts:
-                    return {"samples": _t_pc.zeros(0)}
-                shapes = {tuple(x.shape[1:]) for x in parts}
-                if len(shapes) > 1:
-                    return {"samples": parts[0]}
-                return {"samples": _t_pc.cat(parts, dim=0)}
 
             print("[H3Memory] chain_id=%r paused: %d/%d shot(s) rendered so "
                   "far. Run again with resume_chain=True (same chain_id) to "
