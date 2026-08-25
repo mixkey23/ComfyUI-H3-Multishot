@@ -26,6 +26,53 @@ import os
 import subprocess
 
 
+def normalize_color_adjustment(value=None):
+    """Clamp a per-shot colour adjustment dict to the same range/defaults
+    the color-editor widget uses: 100 = neutral on every axis."""
+    raw = value if isinstance(value, dict) else {}
+
+    def _v(name, default, low, high):
+        try:
+            x = float(raw.get(name, default))
+        except (TypeError, ValueError):
+            x = float(default)
+        return max(float(low), min(float(high), x))
+
+    return {
+        "saturation": _v("saturation", 100.0, 0.0, 200.0),
+        "contrast": _v("contrast", 100.0, 50.0, 150.0),
+        "brightness": _v("brightness", 100.0, 50.0, 150.0),
+    }
+
+
+def color_adjustment_is_neutral(value):
+    c = normalize_color_adjustment(value)
+    return all(abs(c[k] - 100.0) < 1e-6
+              for k in ("saturation", "contrast", "brightness"))
+
+
+def _apply_color_adjustment(x, adjustment):
+    """x: [T,H,W,3] float 0..1. Same transform model as a browser's CSS
+    saturate()/contrast()/brightness() filter (Filter Effects spec
+    luminance coefficients for saturate, so a live CSS preview and this
+    baked result agree pixel-for-pixel modulo rounding)."""
+    import torch
+    c = normalize_color_adjustment(adjustment)
+    sat = c["saturation"] / 100.0
+    contrast = c["contrast"] / 100.0
+    brightness = c["brightness"] / 100.0
+
+    rr, rg, rb = 0.213 + 0.787 * sat, 0.715 - 0.715 * sat, 0.072 - 0.072 * sat
+    gr, gg, gb = 0.213 - 0.213 * sat, 0.715 + 0.285 * sat, 0.072 - 0.072 * sat
+    br, bg, bb = 0.213 - 0.213 * sat, 0.715 - 0.715 * sat, 0.072 + 0.928 * sat
+    mat = x.new_tensor([[rr, rg, rb], [gr, gg, gb], [br, bg, bb]])
+    x = x @ mat.T
+
+    gain = contrast * brightness
+    offset = 0.5 * (1.0 - contrast) * brightness
+    return (x * gain + offset).clamp(0.0, 1.0)
+
+
 def _ffmpeg():
     import shutil
     p = shutil.which("ffmpeg")
@@ -201,13 +248,20 @@ class ShotStreamWriter:
         os.replace(tagged, master_path)
 
     def finalize(self, master_path, mode, waveform, sr,
-                 prompt=None, extra_pnginfo=None):
-        """Re-stream temps through the gains into one encoder."""
+                 prompt=None, extra_pnginfo=None, color_adjustments=None):
+        """Re-stream temps through the gains into one encoder.
+
+        color_adjustments: optional {shot_index(int): {"saturation",
+        "contrast", "brightness"}} - the color-editor's per-shot correction,
+        baked in here at export time. The cached lossless temps themselves
+        stay neutral, so re-exporting with different adjustments (no
+        re-sampling) always starts from the same source."""
         import torch
         self._finalized = True     # from here on, failures KEEP their temps
         if self.pending is not None:
             self._stage(self.pending)
             self.pending = None
+        color_adjustments = color_adjustments or {}
         gains = self._gains(mode)
         if gains is not None:
             lg_all, cg_all, luma_all = gains
@@ -265,7 +319,12 @@ class ShotStreamWriter:
                          name="h3-master-watchdog").start()
         off = 0
         try:
-            for s in self.shots:
+            for _shot_idx, s in enumerate(self.shots):
+                _adj = color_adjustments.get(_shot_idx)
+                if _adj is None:
+                    _adj = color_adjustments.get(str(_shot_idx))
+                _adj_neutral = (_adj is None
+                               or color_adjustment_is_neutral(_adj))
                 dec = subprocess.Popen(
                     [_ffmpeg(), "-v", "error", "-i", s["path"],
                      "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
@@ -293,6 +352,8 @@ class ShotStreamWriter:
                             x = (x - m) * c + m * g
                         else:
                             x = x * g
+                    if not _adj_neutral:
+                        x = _apply_color_adjustment(x, _adj)
                     enc.stdin.write((x.clamp(0, 1) * 255).round()
                                     .to(torch.uint8).numpy().tobytes())
                     _wd["t"] = _wt.time()

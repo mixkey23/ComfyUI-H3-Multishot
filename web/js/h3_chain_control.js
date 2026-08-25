@@ -81,6 +81,73 @@ function pollWhileAlive(node, refresh) {
     refresh();
 }
 
+// Per-shot saturation/contrast/brightness, baked in only at export time
+// (h3_stream_master.py:_apply_color_adjustment) - adjusting and re-
+// exporting never re-samples anything, since it works from the already-
+// staged lossless shot files. Mirrors the Extender pack's own colour
+// editor, minus the live CSS-filter preview (ComfyUI's own generated
+// output preview is not a stable enough DOM target to hook reliably
+// across frontend versions) - set values, Save, Re-export, look at the
+// result.
+function addColorEditor(node, getChainId) {
+    const shotWidget = node.addWidget("number", "color_shot", 1,
+        () => {}, { min: 1, max: 9999, step: 10, precision: 0 });
+    shotWidget.tooltip = "Which shot (1-based) the sliders below edit.";
+    const satWidget = node.addWidget("slider", "color_saturation", 100,
+        () => {}, { min: 0, max: 200 });
+    const conWidget = node.addWidget("slider", "color_contrast", 100,
+        () => {}, { min: 50, max: 150 });
+    const briWidget = node.addWidget("slider", "color_brightness", 100,
+        () => {}, { min: 50, max: 150 });
+    for (const w of [shotWidget, satWidget, conWidget, briWidget]) {
+        w.serialize = false;   // per-shot editing state, not part of the graph
+    }
+
+    node.addWidget("button", "🎨 Save color for shot", null, async () => {
+        const chainId = getChainId();
+        if (!chainId) { alert("No chain_id yet - render at least shot 1 first."); return; }
+        try {
+            const res = await api.fetchApi("/h3multishot/color_adjust", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    chain_id: chainId,
+                    shot_index: Math.max(0, Math.round(shotWidget.value) - 1),
+                    adjustment: { saturation: satWidget.value,
+                                 contrast: conWidget.value,
+                                 brightness: briWidget.value },
+                }),
+            });
+            const payload = await res.json();
+            if (!res.ok || payload.error) {
+                throw new Error(payload.error || `HTTP ${res.status}`);
+            }
+        } catch (e) {
+            alert(`Save color failed: ${e.message ?? e}`);
+        }
+    });
+
+    node.addWidget("button", "📤 Re-export master (no re-render)", null,
+        async () => {
+            const chainId = getChainId();
+            if (!chainId) { alert("No chain_id yet."); return; }
+            try {
+                const res = await api.fetchApi("/h3multishot/reexport", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ chain_id: chainId }),
+                });
+                const payload = await res.json();
+                if (!res.ok || payload.error) {
+                    throw new Error(payload.error || `HTTP ${res.status}`);
+                }
+                alert(`Re-exported: ${payload.master_path}`);
+            } catch (e) {
+                alert(`Re-export failed: ${e.message ?? e}`);
+            }
+        });
+}
+
 function setupMemorySampler(node) {
     const status = addStatusWidget(node);
 
@@ -152,6 +219,11 @@ function setupMemorySampler(node) {
             }
             queueOne(1, idx, `regenerate shot ${idx}`);
         });
+
+    addColorEditor(node, () => {
+        const idWidget = findWidget(node, "chain_id");
+        return String(idWidget?.value || "").trim();
+    });
 }
 
 function setupExtender(node) {
@@ -174,6 +246,12 @@ function setupExtender(node) {
         }
     };
     pollWhileAlive(node, refresh);
+
+    addColorEditor(node, () => {
+        const overrideWidget = findWidget(node, "chain_id_override");
+        const override = String(overrideWidget?.value || "").trim();
+        return override || `extender_${node.id}`;
+    });
 }
 
 app.registerExtension({

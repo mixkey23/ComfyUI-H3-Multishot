@@ -3262,6 +3262,19 @@ def _h3_load_manifest(path):
         return _json.load(f)
 
 
+def _h3_update_manifest(path, updates):
+    """Merge `updates` into the manifest already on disk (or a fresh one)
+    and write atomically. NEVER construct a manifest from scratch at a
+    write site that isn't starting a new chain - color_adjustments (set by
+    the color-editor's POST route) and master_path (set at finalize) have
+    to survive every later write, including the ones this module's own
+    per-shot loop makes on every shot."""
+    existing = _h3_load_manifest(path) or {}
+    existing.update(updates)
+    _h3_write_manifest_atomic(path, existing)
+    return existing
+
+
 def _h3_prune_chain_tail(chain_id, keep_max_index):
     """Delete every per-shot state file AND staged video file whose index is
     ABOVE keep_max_index. Called the moment a job commits to rendering (or
@@ -3372,6 +3385,68 @@ def _h3_make_stream_writer(fixed_dir, fps=24):
     w.pending = None
     w._finalized = False
     return w
+
+
+def _h3_reexport_master(chain_id, master_normalize=None):
+    """Re-bake the finished master from already-staged shots - no
+    re-sampling, no model/VAE needed. This is what the colour editor's
+    "Re-export" action calls: adjust a shot's saturation/contrast/
+    brightness (saved separately, in the manifest's color_adjustments), hit
+    re-export, get a new master with the correction baked in."""
+    import os
+    manifest_path = _h3_chain_manifest_path(chain_id)
+    manifest = _h3_load_manifest(manifest_path)
+    if manifest is None:
+        raise ValueError("chain_id=%r has no saved state." % chain_id)
+    n = int(manifest.get("n_total", 0))
+    if not manifest.get("complete") or n <= 0:
+        raise ValueError(
+            "chain_id=%r is not finished yet (%s/%s shots) - nothing to "
+            "re-export." % (chain_id, manifest.get("next_shot", 0), n))
+    state = _h3_load_chain_state(_h3_chain_step_path(chain_id, n - 1))
+    if state is None:
+        raise ValueError("chain_id=%r's final state file is missing - "
+                         "cannot re-export." % chain_id)
+    mode = (master_normalize if master_normalize is not None
+           else manifest.get("master_normalize", "off"))
+
+    writer = _h3_make_stream_writer(_h3_chain_stream_dir(chain_id), fps=24)
+    writer.shots = list(state.get("stream_shots") or [])
+    writer.luma = list(state.get("stream_luma") or [])
+    writer.std = list(state.get("stream_std") or [])
+    writer.pending = state.get("stream_pending")
+    if not writer.shots and writer.pending is None:
+        raise ValueError("chain_id=%r has no staged shots to export."
+                         % chain_id)
+
+    audio_parts = list(state.get("audio_parts") or [])
+    sr = state.get("sr")
+    if not audio_parts or sr is None:
+        raise ValueError("chain_id=%r's saved state has no audio to "
+                         "export." % chain_id)
+    waveform = _xfade_audio(audio_parts, sr, ms=40)
+
+    color_adj = {}
+    for _k, _v in (manifest.get("color_adjustments") or {}).items():
+        try:
+            color_adj[int(_k)] = _v
+        except (TypeError, ValueError):
+            pass
+
+    import folder_paths as _fp
+    mdir = os.path.join(_fp.get_output_directory(), "video", "H3CHAIN_STREAM")
+    os.makedirs(mdir, exist_ok=True)
+    i = 1
+    while os.path.exists(os.path.join(mdir, "master_%05d.mp4" % i)):
+        i += 1
+    mpath = os.path.join(mdir, "master_%05d.mp4" % i)
+
+    writer.finalize(mpath, mode, waveform, sr, color_adjustments=color_adj)
+
+    _h3_update_manifest(manifest_path, {
+        "master_path": mpath, "master_normalize": mode,
+        "updated_at": __import__("time").time()})
+    return mpath
 
 
 class _H3ChainBank:
@@ -4327,12 +4402,13 @@ class H3MultishotMemorySampler:
                             _os_promote.remove(_cand_path)
                         except OSError:
                             pass
-                        _h3_write_manifest_atomic(_chain_manifest_path, {
+                        _h3_update_manifest(_chain_manifest_path, {
                             "format": "h3_multishot_chain_manifest_v1",
                             "chain_id": chain_id, "config_fp": _chain_cfg_fp,
                             "n_total": n, "next_shot": _chain_start_si + 1,
                             "complete": (_chain_start_si + 1 >= n),
                             "stream_dir": _h3_chain_stream_dir(chain_id),
+                            "master_normalize": master_normalize,
                             "created_at": _chain_manifest.get("created_at"),
                             "updated_at": __import__("time").time(),
                         })
@@ -4375,12 +4451,19 @@ class H3MultishotMemorySampler:
                     # it must not be resumable or regenerate-able anymore -
                     # exactly the Extender pack's own truncate-on-rewrite.
                     _h3_prune_chain_tail(chain_id, _chain_start_si - 1)
+                    # a colour edit for a shot about to be re-rendered
+                    # describes content that is about to stop existing
+                    _stale_adj = _chain_manifest.get("color_adjustments") or {}
+                    _kept_adj = {k: v for k, v in _stale_adj.items()
+                                if int(k) < _chain_start_si}
                     _h3_write_manifest_atomic(_chain_manifest_path, {
                         "format": "h3_multishot_chain_manifest_v1",
                         "chain_id": chain_id, "config_fp": _chain_cfg_fp,
                         "n_total": n, "next_shot": _chain_start_si,
                         "complete": False,
                         "stream_dir": _h3_chain_stream_dir(chain_id),
+                        "master_normalize": master_normalize,
+                        "color_adjustments": _kept_adj,
                         "created_at": _chain_manifest.get("created_at"),
                         "updated_at": __import__("time").time(),
                     })
@@ -6414,12 +6497,13 @@ class H3MultishotMemorySampler:
                         _chain_snapshot(si + 1))
                     _chain_candidate_preview = (imgs.cpu(), wav.cpu(),
                                                 float(sr))
-                    _h3_write_manifest_atomic(_chain_manifest_path, {
+                    _h3_update_manifest(_chain_manifest_path, {
                         "format": "h3_multishot_chain_manifest_v1",
                         "chain_id": chain_id, "config_fp": _chain_cfg_fp,
                         "n_total": n, "next_shot": si, "complete": False,
                         "pending_candidate": si + 1,
                         "stream_dir": _h3_chain_stream_dir(chain_id),
+                        "master_normalize": master_normalize,
                         "created_at": (_chain_manifest or {}).get(
                             "created_at", __import__("time").time()),
                         "updated_at": __import__("time").time(),
@@ -6440,12 +6524,14 @@ class H3MultishotMemorySampler:
                 _h3_save_chain_state(_h3_chain_step_path(chain_id, si),
                                      _chain_snapshot(si + 1))
                 _h3_prune_chain_tail(chain_id, si)
-                _h3_write_manifest_atomic(_chain_manifest_path, {
+                _h3_update_manifest(_chain_manifest_path, {
                     "format": "h3_multishot_chain_manifest_v1",
                     "chain_id": chain_id, "config_fp": _chain_cfg_fp,
                     "n_total": n, "next_shot": si + 1,
                     "complete": (si + 1 >= n),
                     "stream_dir": _h3_chain_stream_dir(chain_id),
+                    "master_normalize": master_normalize,
+                    "pending_candidate": None,
                     "created_at": (_chain_manifest or {}).get(
                         "created_at", __import__("time").time()),
                     "updated_at": __import__("time").time(),
@@ -6579,9 +6665,18 @@ class H3MultishotMemorySampler:
             while os.path.exists(os.path.join(_mdir, "master_%05d.mp4" % _i)):
                 _i += 1
             _mpath = os.path.join(_mdir, "master_%05d.mp4" % _i)
+            _color_adj = {}
+            if chain_id:
+                _cm = _h3_load_manifest(_chain_manifest_path) or {}
+                for _k, _v in (_cm.get("color_adjustments") or {}).items():
+                    try:
+                        _color_adj[int(_k)] = _v
+                    except (TypeError, ValueError):
+                        pass
             _stream_writer.finalize(_mpath, master_normalize, waveform, sr,
                                     prompt=_api_prompt,
-                                    extra_pnginfo=_api_pnginfo)
+                                    extra_pnginfo=_api_pnginfo,
+                                    color_adjustments=_color_adj)
             if chain_id:
                 # last write for this chain: record the finished file's path
                 # in the manifest too, so an external poller sees it without

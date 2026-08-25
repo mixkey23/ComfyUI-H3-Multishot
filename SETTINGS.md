@@ -693,6 +693,31 @@ and nothing changes. They exist for a script or a person who would rather
 add/remove one cable per shot or reference than maintain one long text
 block or a manually-batched image list.
 
+#### Per-shot colour editor (`chain_id` chains)
+
+Both `H3MultishotMemorySampler` (with `chain_id`) and `H3MultishotExtender`
+grow four extra widgets: `color_shot` (which shot, 1-based) and three
+sliders - `color_saturation` (0-200), `color_contrast` (50-150),
+`color_brightness` (50-150), all neutral at 100 - plus **🎨 Save color for
+shot** and **📤 Re-export master (no re-render)**.
+
+Same idea as the Extender pack's own colour editor: the correction is
+**not** baked into anything until you export. Set the sliders for a shot,
+hit Save (writes into the chain's manifest - no sampling, no re-render),
+adjust another shot the same way, and once you are happy hit Re-export -
+that re-streams the already-cached lossless shots straight to the final
+master with every saved correction applied, entirely from disk. No model,
+no VAE, no GPU sampling involved, so it is fast and you can re-export as
+many times as you want while dialing it in - there is no live preview of
+the correction in the node itself (yet); Save then Re-export and look at
+the result. The transform is the same saturate/contrast/brightness model a
+browser's CSS filter uses, so a future live preview built on `filter:
+saturate(...) contrast(...) brightness(...)` would match the baked result
+pixel-for-pixel (modulo rounding).
+
+Re-export only works once the chain is complete (every shot rendered) -
+there is nothing staged to re-export before that.
+
 ### Remote text encoder (`H3 Remote Text Encoder`, optional)
 
 The text encoder works for a few seconds per shot and holds 15+ GB the whole
