@@ -3449,6 +3449,46 @@ def _h3_reexport_master(chain_id, master_normalize=None):
     return mpath
 
 
+def _h3_shot_preview_png(chain_id, shot_index):
+    """One representative (middle) frame of shot `shot_index` (0-based) as
+    PNG bytes - confirmed or still-candidate, whichever exists.
+
+    Works uniformly for both because of how the stream writer's deferred
+    staging already behaves: _chain_snapshot(next_shot) is always saved
+    right after a shot finishes rendering, at which point that shot's own
+    pixels are sitting in _stream_writer.pending (staged to disk only on
+    the NEXT shot's .add() call or at finalize) - so every step_%04d.h3state
+    and candidate_%04d.h3state file's stream_pending field IS exactly that
+    shot's own decoded frames, with no ffmpeg or extra bookkeeping needed.
+
+    Always the NEUTRAL frame (the cached shot is never colour-adjusted in
+    place) - the color editor applies its filter client-side on top of
+    this, at the same 100-centered values _apply_color_adjustment bakes in
+    at export, so the live look and the exported one agree.
+    """
+    import io
+    import torch
+    state = _h3_load_chain_state(_h3_chain_step_path(chain_id, shot_index))
+    if state is None:
+        state = _h3_load_chain_state(
+            _h3_chain_candidate_path(chain_id, shot_index))
+    if state is None:
+        raise ValueError("no rendered or candidate state for chain_id=%r "
+                         "shot %d" % (chain_id, shot_index + 1))
+    pending = state.get("stream_pending")
+    if pending is None:
+        raise ValueError("chain_id=%r shot %d has no decoded frame saved "
+                         "(state predates this feature, or was written by "
+                         "a job that already staged past it)."
+                         % (chain_id, shot_index + 1))
+    frame = pending[pending.shape[0] // 2].detach().cpu().float()
+    frame = (frame.clamp(0, 1) * 255).round().to(torch.uint8).numpy()
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(frame, mode="RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
 class _H3ChainBank:
     """Bounded frame bank: pinned earliest entries + recency tail.
 

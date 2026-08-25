@@ -11,9 +11,13 @@ h3_chain_control.js) can poll it too, and so an external orchestrator
 a route to hit instead of needing filesystem access to ComfyUI's output
 directory.
 
-It also owns the two write actions the colour editor needs, mirroring the
-Motion-Context Extender pack's own color_editor_info/color_adjust routes:
+It also owns the write actions and the live-preview read the colour editor
+needs, mirroring the Motion-Context Extender pack's own color_editor_info/
+color_adjust routes:
 
+  GET  /h3multishot/shot_preview  - one representative frame of a shot
+      (confirmed or still-candidate), as a plain PNG - always the NEUTRAL
+      frame, so the node's live CSS filter and the baked export agree.
   POST /h3multishot/color_adjust  - save one shot's saturation/contrast/
       brightness into the manifest. Does not touch any cached pixels -
       the correction is only baked in at export time (see reexport below),
@@ -23,12 +27,13 @@ Motion-Context Extender pack's own color_editor_info/color_adjust routes:
       via H3MultishotUtils._h3_reexport_master. No model/VAE/GPU sampling
       involved - just decode the cached lossless shots and re-encode.
 
-Importing this module registers these three routes on whatever ComfyUI
+Importing this module registers these four routes on whatever ComfyUI
 instance loads the pack.
 """
 import logging
 
 _STATE_ROUTE = "/h3multishot/chain_state"
+_SHOT_PREVIEW_ROUTE = "/h3multishot/shot_preview"
 _COLOR_ADJUST_ROUTE = "/h3multishot/color_adjust"
 _REEXPORT_ROUTE = "/h3multishot/reexport"
 _LOG = logging.getLogger("h3_multishot.chain_api")
@@ -64,6 +69,27 @@ def _register_routes():
         resp = dict(manifest)
         resp["exists"] = True
         return web.json_response(resp)
+
+    @ps.routes.get(_SHOT_PREVIEW_ROUTE)
+    async def h3_shot_preview(request):  # noqa: ANN001
+        chain_id = request.query.get("chain_id", "").strip()
+        if not chain_id:
+            return web.json_response(
+                {"error": "chain_id query param is required"}, status=400)
+        try:
+            shot_index = int(request.query.get("shot_index", ""))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "shot_index query param must be an integer "
+                          "(0-based)"}, status=400)
+        try:
+            import asyncio
+            from .h3_multishot_utils import _h3_shot_preview_png
+            png = await asyncio.get_event_loop().run_in_executor(
+                None, _h3_shot_preview_png, chain_id, shot_index)
+            return web.Response(body=png, content_type="image/png")
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=404)
 
     @ps.routes.post(_COLOR_ADJUST_ROUTE)
     async def h3_color_adjust(request):  # noqa: ANN001
@@ -130,8 +156,9 @@ def _register_routes():
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": str(e)}, status=500)
 
-    _LOG.info("[H3-Multishot] chain routes registered: GET %s, POST %s, "
-             "POST %s", _STATE_ROUTE, _COLOR_ADJUST_ROUTE, _REEXPORT_ROUTE)
+    _LOG.info("[H3-Multishot] chain routes registered: GET %s, GET %s, "
+             "POST %s, POST %s", _STATE_ROUTE, _SHOT_PREVIEW_ROUTE,
+             _COLOR_ADJUST_ROUTE, _REEXPORT_ROUTE)
 
 
 _register_routes()

@@ -82,26 +82,69 @@ function pollWhileAlive(node, refresh) {
 }
 
 // Per-shot saturation/contrast/brightness, baked in only at export time
-// (h3_stream_master.py:_apply_color_adjustment) - adjusting and re-
-// exporting never re-samples anything, since it works from the already-
-// staged lossless shot files. Mirrors the Extender pack's own colour
-// editor, minus the live CSS-filter preview (ComfyUI's own generated
-// output preview is not a stable enough DOM target to hook reliably
-// across frontend versions) - set values, Save, Re-export, look at the
-// result.
+// (h3_stream_master.py:_apply_color_adjustment). The live preview below is
+// a real DOM <img> (node.addDOMWidget), not ComfyUI's own canvas-drawn node
+// preview - that one is drawn via ctx.drawImage internals that vary across
+// frontend versions and are not a stable target for a CSS filter. This
+// <img> is entirely this extension's own, fetched from GET /h3multishot/
+// shot_preview (always the NEUTRAL frame - the cached shot is never
+// adjusted in place) and styled with `filter: saturate() contrast()
+// brightness()`, the SAME CSS transform model _apply_color_adjustment
+// bakes in server-side, so what you see here is what Re-export produces.
 function addColorEditor(node, getChainId) {
+    const img = document.createElement("img");
+    img.style.width = "100%";
+    img.style.display = "block";
+    img.style.imageRendering = "pixelated";
+    img.alt = "shot preview (set chain_id and render/confirm a shot)";
+
+    let previewWidget = null;
+    if (typeof node.addDOMWidget === "function") {
+        try {
+            previewWidget = node.addDOMWidget(
+                "color_preview", "H3ColorPreview", img, { serialize: false });
+        } catch (e) {
+            console.warn("[H3-Multishot] color preview DOM widget failed "
+                + "to attach - sliders/Save/Re-export still work.", e);
+        }
+    }
+
     const shotWidget = node.addWidget("number", "color_shot", 1,
-        () => {}, { min: 1, max: 9999, step: 10, precision: 0 });
+        () => { refreshPreviewImage(); }, { min: 1, max: 9999, step: 10, precision: 0 });
     shotWidget.tooltip = "Which shot (1-based) the sliders below edit.";
+    const applyFilter = () => {
+        img.style.filter = `saturate(${satWidget.value}%) `
+            + `contrast(${conWidget.value}%) brightness(${briWidget.value}%)`;
+    };
     const satWidget = node.addWidget("slider", "color_saturation", 100,
-        () => {}, { min: 0, max: 200 });
+        applyFilter, { min: 0, max: 200 });
     const conWidget = node.addWidget("slider", "color_contrast", 100,
-        () => {}, { min: 50, max: 150 });
+        applyFilter, { min: 50, max: 150 });
     const briWidget = node.addWidget("slider", "color_brightness", 100,
-        () => {}, { min: 50, max: 150 });
+        applyFilter, { min: 50, max: 150 });
     for (const w of [shotWidget, satWidget, conWidget, briWidget]) {
         w.serialize = false;   // per-shot editing state, not part of the graph
     }
+    applyFilter();
+
+    // Always re-fetches (no change-guard): a regenerated shot keeps the
+    // same chain_id/shot_index but its underlying pixels changed, so
+    // "nothing looks different about the request" cannot be the signal to
+    // skip it. The fetched PNG is a single small middle-frame image, so
+    // re-fetching on every poll tick is cheap.
+    const refreshPreviewImage = () => {
+        const chainId = getChainId();
+        const shotIndex = Math.max(0, Math.round(shotWidget.value) - 1);
+        if (!chainId) {
+            img.removeAttribute("src");
+            return;
+        }
+        const url = api.apiURL(
+            `/h3multishot/shot_preview?chain_id=${encodeURIComponent(chainId)}`
+            + `&shot_index=${shotIndex}&t=${Date.now()}`);
+        img.onerror = () => { img.removeAttribute("src"); };
+        img.src = url;
+    };
 
     node.addWidget("button", "🎨 Save color for shot", null, async () => {
         const chainId = getChainId();
@@ -146,6 +189,13 @@ function addColorEditor(node, getChainId) {
                 alert(`Re-export failed: ${e.message ?? e}`);
             }
         });
+
+    // Picks up a newly rendered/confirmed shot automatically (once its
+    // state file exists) and a chain_id typed in after node creation.
+    // Cheap: only actually re-fetches when chain_id/shot_index changed
+    // since the last check (see the `key`/`lastFetchedKey` guard above).
+    refreshPreviewImage();
+    pollWhileAlive(node, refreshPreviewImage);
 }
 
 function setupMemorySampler(node) {
