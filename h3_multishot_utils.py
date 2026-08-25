@@ -4061,6 +4061,20 @@ class H3MultishotMemorySampler:
                            "external caller rejects a shot and tries again "
                            "without re-rendering the shots already accepted. "
                            "Refused if shot N has not rendered yet."}),
+            "prompt_pack": ("H3_PROMPT_PACK", {
+                "tooltip": "From H3PromptPackBridge: one connected STRING "
+                           "socket per shot, packed in cable order. "
+                           "Overrides the script widget entirely when "
+                           "connected - add or remove a shot by wiring or "
+                           "unwiring a text node instead of editing '---' "
+                           "separators by hand."}),
+            "reference_pack": ("H3_REF_PACK", {
+                "tooltip": "From H3ReferencePackBridge: up to 9 individually "
+                           "wired IMAGE sockets, packed in slot order. "
+                           "Adds to reference_images (both can be used "
+                           "together) - add or remove a reference picture "
+                           "by wiring or unwiring an image source instead "
+                           "of rebuilding a single batch."}),
         },
             # hidden inputs are not widgets, so saved workflows are unaffected
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
@@ -4151,6 +4165,7 @@ class H3MultishotMemorySampler:
             # already exists for the next shot, promote it (no re-sampling)
             # instead of rendering.
             _h3_candidate=False, _h3_candidate_confirm=False,
+            prompt_pack=None, reference_pack=None,
             prompt=None, extra_pnginfo=None):
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
@@ -4181,6 +4196,15 @@ class H3MultishotMemorySampler:
         from comfy_extras import nodes_minimax_h3 as mmh3
         from comfy_extras.nodes_audio import vae_decode_audio
         import comfy.model_management as _mm
+
+        # prompt_pack (H3PromptPackBridge) overrides script entirely when
+        # connected: one connected STRING socket per shot, in cable order -
+        # add/remove a shot by wiring/unwiring a text node instead of
+        # editing '---' separators by hand.
+        if prompt_pack is not None and isinstance(prompt_pack, dict):
+            _pp_prompts = prompt_pack.get("prompts") or []
+            if _pp_prompts:
+                script = "\n---\n".join(str(_p) for _p in _pp_prompts)
 
         shots = _parse_script(script)
         n = shot_count if shot_count > 0 else len(shots)
@@ -4416,9 +4440,25 @@ class H3MultishotMemorySampler:
         # --- subject/character reference images: encode ONCE, fixed slots ---
         import math as _math_ri
         ref_image_items, ref_image_blocks = [], []
+        # Two sources, combined in order: the plain reference_images batch
+        # (one pre-assembled tensor, e.g. from Batch Images) and reference_
+        # pack (H3ReferencePackBridge - an autogrowing set of individually
+        # wired IMAGE sockets, so add/remove is one cable, not re-batching).
+        # Each chunk stays its own [1,H,W,C] tensor here (never concatenated
+        # into one batch) because reference_pack slots are not guaranteed to
+        # share a resolution - the resize below handles each independently
+        # regardless of source.
+        _ref_chunks = []
         if reference_images is not None:
             for _ri in range(reference_images.shape[0]):
-                _img = reference_images[_ri:_ri + 1]
+                _ref_chunks.append(reference_images[_ri:_ri + 1])
+        if reference_pack is not None and isinstance(reference_pack, dict):
+            for _pimg in (reference_pack.get("slots") or []):
+                if _pimg is not None:
+                    _ref_chunks.append(_pimg[:1] if _pimg.shape[0] > 1
+                                       else _pimg)
+        if _ref_chunks:
+            for _img in _ref_chunks:
                 _h, _w = _img.shape[1], _img.shape[2]
                 if reference_image_size == "match":
                     _sc = min(1.0, _math_ri.sqrt((width * height) / (_w * _h)))

@@ -671,6 +671,28 @@ cache, same continuity dials, just a different front door.
 links, same test script), `chain_id_override` pre-set to `test_extender`.
 Load it, toggle `validated`, queue, repeat.
 
+#### `H3PromptPackBridge` / `H3ReferencePackBridge` - add/remove a shot or a reference by cable
+
+Both `H3MultishotMemorySampler` and `H3MultishotExtender` normally take one
+`script` STRING (shots separated by `---`) and one `reference_images` IMAGE
+batch. These two small bridge nodes let you add or remove a SHOT or a
+REFERENCE PICTURE by wiring or unwiring one cable instead of editing text or
+rebuilding a batch:
+
+- **`H3PromptPackBridge`**: connect a Text/String node to `prompt_1` - a
+  `prompt_2` socket appears automatically. Keep connecting to add shots;
+  disconnect one to remove that shot (later ones compact down, cables
+  intact - no silent renumbering). Its `prompt_pack` output, wired into the
+  sampler's `prompt_pack` input, REPLACES the `script` widget entirely.
+- **`H3ReferencePackBridge`**: same idea with `ref_1`, `ref_2`, ... and an
+  IMAGE source per socket. Its `reference_pack` output ADDS to whatever
+  `reference_images` already carries (both can be used together).
+
+Neither bridge is required - leave `script`/`reference_images` as they are
+and nothing changes. They exist for a script or a person who would rather
+add/remove one cable per shot or reference than maintain one long text
+block or a manually-batched image list.
+
 ### Remote text encoder (`H3 Remote Text Encoder`, optional)
 
 The text encoder works for a few seconds per shot and holds 15+ GB the whole
