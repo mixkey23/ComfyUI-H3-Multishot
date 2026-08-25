@@ -4190,6 +4190,14 @@ class H3MultishotMemorySampler:
                            "together) - add or remove a reference picture "
                            "by wiring or unwiring an image source instead "
                            "of rebuilding a single batch."}),
+            "reference_uploads": ("STRING", {
+                "default": "[]", "multiline": False,
+                "tooltip": "Managed by the clip-by-clip panel's reference "
+                           "grid - a JSON array of filenames uploaded "
+                           "through it (ComfyUI's own image upload, same "
+                           "one LoadImage uses). Adds to reference_images/"
+                           "reference_pack (all three combine). Not meant "
+                           "to be hand-edited."}),
         },
             # hidden inputs are not widgets, so saved workflows are unaffected
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
@@ -4280,7 +4288,7 @@ class H3MultishotMemorySampler:
             # already exists for the next shot, promote it (no re-sampling)
             # instead of rendering.
             _h3_candidate=False, _h3_candidate_confirm=False,
-            prompt_pack=None, reference_pack=None,
+            prompt_pack=None, reference_pack=None, reference_uploads="[]",
             prompt=None, extra_pnginfo=None):
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
@@ -4580,6 +4588,38 @@ class H3MultishotMemorySampler:
                 if _pimg is not None:
                     _ref_chunks.append(_pimg[:1] if _pimg.shape[0] > 1
                                        else _pimg)
+        if reference_uploads and str(reference_uploads).strip() not in (
+                "", "[]"):
+            # The clip-by-clip panel's reference grid: files uploaded
+            # through ComfyUI's own /upload/image (the same route LoadImage
+            # uses), named here by the panel, loaded the same way LoadImage
+            # loads them - no new upload machinery needed on this side.
+            try:
+                import json as _json_ru
+                _up_names = _json_ru.loads(reference_uploads)
+            except Exception as _e:
+                _up_names = []
+                print("[H3Memory] reference_uploads: could not parse %r "
+                      "(%s) - ignored." % (reference_uploads, _e),
+                      flush=True)
+            if isinstance(_up_names, list):
+                import numpy as _np_ru
+                import folder_paths as _fp_ru
+                from PIL import Image as _Image_ru, ImageOps as _ImageOps_ru
+                for _fname in _up_names:
+                    try:
+                        _fpath = _fp_ru.get_annotated_filepath(
+                            str(_fname))
+                        _pil = _ImageOps_ru.exif_transpose(
+                            _Image_ru.open(_fpath)).convert("RGB")
+                        _arr = _np_ru.array(_pil).astype(_np_ru.float32) \
+                            / 255.0
+                        _ref_chunks.append(
+                            torch.from_numpy(_arr)[None, ])
+                    except Exception as _e:
+                        print("[H3Memory] reference_uploads: could not "
+                              "load %r (%s) - skipped." % (_fname, _e),
+                              flush=True)
         if _ref_chunks:
             for _img in _ref_chunks:
                 _h, _w = _img.shape[1], _img.shape[2]

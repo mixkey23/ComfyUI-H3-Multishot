@@ -693,6 +693,44 @@ and nothing changes. They exist for a script or a person who would rather
 add/remove one cable per shot or reference than maintain one long text
 block or a manually-batched image list.
 
+#### Clip-by-clip panel
+
+`H3MultishotMemorySampler` (with `chain_id`) and `H3MultishotExtender` grow
+a visual panel below their normal widgets - a card per shot, a reference
+picture grid, and Save/Load Project - in the spirit of the Motion-Context
+Extender pack's own node panel. It sits ALONGSIDE the native widgets from
+the sections above (chain_id/validated/the colour sliders/etc. are
+unchanged; the panel reads and writes them, it does not replace them).
+
+- **Clip cards**: one per shot, parsed from the `script` widget ('---'-
+  separated). Each shows the prompt (editable - writes back into `script`),
+  the computed seed (`seed [+ index if seed_per_shot]`) and duration, and a
+  **Validated** checkbox. Checking it on the card marked **NEXT** renders
+  (or confirms an already-rendered candidate for) that shot and advances.
+  Unchecking it on an already-**VALIDATED** card asks for confirmation,
+  then re-renders that shot as a fresh candidate and discards every shot
+  after it - exactly `regenerate_from_shot`, just from a checkbox instead
+  of typing a number. The **👁 Preview** button on the NEXT card renders it
+  as a candidate without confirming (`H3MultishotExtender` only - chain_id
+  mode on `H3MultishotMemorySampler` always confirms immediately, so that
+  button is hidden there).
+- **+ Add Clip / − Remove Last**: append or drop a `'---'`-separated block
+  in `script`. Disabled (with an explanation) when `prompt_pack` is wired,
+  since the bridge node owns the shot list then.
+- **Reference grid**: up to 9 slots. Click an empty one to upload a picture
+  (ComfyUI's own `/upload/image` - the same route `LoadImage` uses); click
+  the × on a filled one to remove it. These add to `reference_images`/
+  `reference_pack` if either is also wired (all three combine).
+- **Save Project / Load Project**: a plain `.json` file (downloaded/loaded
+  entirely in the browser, no server round-trip) capturing `script`, the
+  uploaded reference filenames, and the chain id - a portable snapshot of
+  what you were editing, not the render cache itself (that stays wherever
+  `chain_id`'s manifest/state already lives on disk).
+
+Card status (validated/next/pending) is read from the same manifest the
+status line and colour editor already poll, so it can lag a poll interval
+(a few seconds) behind a job that just finished.
+
 #### Per-shot colour editor (`chain_id` chains)
 
 Both `H3MultishotMemorySampler` (with `chain_id`) and `H3MultishotExtender`

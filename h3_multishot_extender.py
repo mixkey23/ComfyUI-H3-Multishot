@@ -21,14 +21,16 @@ stability across separately-submitted API prompts.
 """
 from .h3_multishot_utils import H3MultishotMemorySampler
 
-_DROP_OPTIONAL = ("chain_id", "resume_chain", "shots_this_run",
-                  "regenerate_from_shot")
+_DROP_OPTIONAL = ("chain_id", "resume_chain", "shots_this_run")
 
 
 class H3MultishotExtender:
     """MiniMaxH3Extender-style node: one node, re-queued per shot, a single
-    `validated` toggle instead of chain_id/resume_chain/shots_this_run/
-    regenerate_from_shot. Wraps H3MultishotMemorySampler.run()."""
+    `validated` toggle instead of chain_id/resume_chain/shots_this_run.
+    regenerate_from_shot is kept (unlike those three) so the clip panel
+    (web/js/h3_clip_panel.js) can redo an earlier, already-confirmed clip -
+    normal use never needs to touch it by hand. Wraps
+    H3MultishotMemorySampler.run()."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -72,7 +74,8 @@ class H3MultishotExtender:
     CATEGORY = "sampling/minimax"
 
     def extend(self, validated=False, chain_id_override="",
-              unique_id=None, prompt=None, extra_pnginfo=None, **kw):
+              regenerate_from_shot=0, unique_id=None, prompt=None,
+              extra_pnginfo=None, **kw):
         from .h3_multishot_utils import (_h3_chain_manifest_path,
                                          _h3_load_manifest)
 
@@ -80,11 +83,13 @@ class H3MultishotExtender:
         if not chain_id:
             chain_id = "extender_%s" % (unique_id if unique_id is not None
                                         else "default")
+        regenerate_from_shot = int(regenerate_from_shot or 0)
 
         manifest = _h3_load_manifest(_h3_chain_manifest_path(chain_id))
         already_started = manifest is not None
 
-        if manifest is not None and manifest.get("complete"):
+        if (regenerate_from_shot <= 0 and manifest is not None
+                and manifest.get("complete")):
             # Re-queueing a finished chain is a normal thing to do with a
             # single re-queued node (nothing stops someone from pressing
             # Queue once more) - H3MultishotMemorySampler's own chain_id
@@ -109,7 +114,7 @@ class H3MultishotExtender:
             chain_id=chain_id,
             resume_chain=already_started,
             shots_this_run=1,
-            regenerate_from_shot=0,
+            regenerate_from_shot=regenerate_from_shot,
             _h3_candidate=not bool(validated),
             _h3_candidate_confirm=bool(validated),
             prompt=prompt, extra_pnginfo=extra_pnginfo,
