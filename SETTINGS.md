@@ -556,34 +556,58 @@ if long chains have ever crashed your machine at the join step, or if you run
 under 32 GB of system RAM. The finished file's path is available on the new
 `master_path` output either way.
 
-### `chain_id` / `resume_chain` / `shots_this_run` - clip-by-clip resumable chains (memory sampler)
+### `chain_id` / `resume_chain` / `shots_this_run` / `regenerate_from_shot` - clip-by-clip resumable chains (memory sampler)
 
 `H3MultishotMemorySampler` normally renders a whole chain - every shot - in
-ONE ComfyUI job. Leave `chain_id` empty and nothing changes.
-
-Set `chain_id` to a name of your choosing to split a chain across MULTIPLE
-jobs instead - one per shot, or a few shots at a time - with the bank, the
-continuity pin, the colour/gain/audio-tone running state, and everything
-rendered so far saved to a
-`chain_multishot_<chain_id>.h3cache` file under
-`output/video/H3CHAIN_STATE/` after every job, and picked back up by the
-next one. This is the same idea as the Motion-Context pack's own disk-cached
-cross-job continuity, applied to the whole memory sampler rather than just
+ONE ComfyUI job. Leave `chain_id` empty and nothing changes. Set it to let an
+external caller (Framesmith, or anything else driving ComfyUI's API) decide
+per chain whether to render it as one job (batch), a few shots per job, or
+one job per shot with a chance to inspect and redo each one before the next
+renders - the same full_batch/clip_by_clip choice the Motion-Context
+Extender pack offers, applied to the whole memory sampler rather than just
 the interior latent pin.
+
+State for a chain lives in two places under `output/video/H3CHAIN_STATE/`:
+
+- `chain_multishot_<chain_id>.json` - a small plain-JSON manifest
+  (`next_shot`, `n_total`, `complete`, `master_path` once finished). No
+  tensors, no torch needed to read it - poll this from outside ComfyUI to
+  track progress.
+- `chain_multishot_<chain_id>_steps/step_%04d.h3state` - one small state
+  file per COMPLETED shot (the bank, the continuity pin, the colour/gain/
+  audio-tone running state, and the output accumulated up to that shot).
+  Keeping one file per shot instead of a single file that gets overwritten
+  is what makes `regenerate_from_shot` possible: the state as of finishing
+  an earlier shot is still on disk even after the chain has moved past it.
+
+Usage:
 
 - First job of a chain: `chain_id` set, `resume_chain` OFF. Renders from
   shot 1.
 - Every later job: the SAME `chain_id`, `resume_chain` ON. Picks up from the
   next unrendered shot.
 - `shots_this_run` caps how many shots render in one job - `0` renders every
-  remaining shot (still checkpointing after each one, so a crash only loses
-  the shot in flight); `1` is true clip-by-clip, one shot per job.
+  remaining shot (BATCH: same result as `chain_id` off, but still
+  checkpointed shot-by-shot so a crash only loses the shot in flight and
+  progress is pollable mid-render); `1` is true CLIP-BY-CLIP, one shot per
+  job.
+- `regenerate_from_shot` (1-based, `0` = off): instead of continuing from the
+  next unrendered shot, redo shot N and everything after it. The state and
+  staged output for shot N onward are discarded immediately when the job
+  starts (before any sampling), so a job that then fails or is cancelled
+  doesn't leave the chain in a half-rewound state worse than just re-running
+  the same regenerate call. Shot N can use a different `script` paragraph,
+  `seed`, or reference than the attempt being replaced - those are NOT part
+  of what has to match between jobs (see below) - while shots before N are
+  left untouched.
 
-`script`, `shot_count`, resolution, `frames_per_shot`, `seed`, and every
-continuity-affecting dial (`continuity`, `bank_pinned`, `memory_frames`,
+Resolution, `frames_per_shot`, `shot_count`, `continuity`, and every bank/
+pin/colour/gain-affecting dial (`bank_pinned`, `memory_frames`,
 `chain_gain_control`, `pin_frames`, and the rest) must match exactly between
 jobs of the same chain - a resume against different settings is refused
 outright rather than silently rendering a chain whose continuity is wrong.
+`script` and `seed` are deliberately NOT checked: changing either for one job
+is exactly how you redo a shot with different wording or a different take.
 
 `master_frames` / `master_audio` / `master_path` stay empty on every job
 except the one that renders the LAST shot, which joins everything staged so

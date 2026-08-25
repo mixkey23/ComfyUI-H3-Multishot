@@ -3191,15 +3191,96 @@ def _h3_chain_cache_dir():
     return d
 
 
-def _h3_chain_cache_path(chain_id):
-    import os
+def _h3_chain_safe_id(chain_id):
     import re as _re
     safe = _re.sub(r"[^A-Za-z0-9_.-]+", "_", str(chain_id).strip())
     if not safe:
         raise ValueError("chain_id must contain at least one "
                           "letter/digit/underscore/dash once sanitised.")
+    return safe
+
+
+def _h3_chain_manifest_path(chain_id):
+    """The chain's small, plain-JSON status file - next_shot/n_total/done,
+    no tensors. An external orchestrator (or a person) can poll this to know
+    where a chain stands without importing torch at all."""
+    import os
     return os.path.join(_h3_chain_cache_dir(),
-                        "chain_multishot_%s.h3cache" % safe)
+                        "chain_multishot_%s.json" % _h3_chain_safe_id(chain_id))
+
+
+def _h3_chain_step_dir(chain_id):
+    """Where per-shot continuity snapshots live - one small file per
+    COMPLETED shot, not one file for the whole chain. This is what makes
+    'redo shot 3, keep 1-2' possible: the state as of finishing shot k-1 is
+    still on disk even after the chain has moved past it."""
+    import os
+    d = os.path.join(_h3_chain_cache_dir(),
+                     "chain_multishot_%s_steps" % _h3_chain_safe_id(chain_id))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _h3_chain_step_path(chain_id, shot_index):
+    import os
+    return os.path.join(_h3_chain_step_dir(chain_id),
+                        "step_%04d.h3state" % int(shot_index))
+
+
+def _h3_chain_stream_dir(chain_id):
+    import os
+    return os.path.join(_h3_chain_cache_dir(),
+                        "stream_%s" % _h3_chain_safe_id(chain_id))
+
+
+def _h3_write_manifest_atomic(path, manifest):
+    import os
+    import json as _json
+    tmp = path + ".tmp_%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _h3_load_manifest(path):
+    import os
+    import json as _json
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return _json.load(f)
+
+
+def _h3_prune_chain_tail(chain_id, keep_max_index):
+    """Delete every per-shot state file AND staged video file whose index is
+    ABOVE keep_max_index. Called the moment a job commits to rendering (or
+    re-rendering) a shot, so a later regenerate can never load a step file
+    that describes a since-abandoned continuation - the exact bug class the
+    Extender pack's own _truncate_chain exists to prevent."""
+    import os
+    import glob as _glob
+    step_dir = _h3_chain_step_dir(chain_id)
+    for p in _glob.glob(os.path.join(step_dir, "step_*.h3state")):
+        try:
+            idx = int(os.path.basename(p)[len("step_"):-len(".h3state")])
+        except ValueError:
+            continue
+        if idx > keep_max_index:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    stream_dir = _h3_chain_stream_dir(chain_id)
+    for p in _glob.glob(os.path.join(stream_dir, "shot_*.mkv")):
+        try:
+            idx = int(os.path.basename(p)[len("shot_"):-len(".mkv")])
+        except ValueError:
+            continue
+        if idx > keep_max_index:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def _h3_chain_config_fingerprint(**kw):
@@ -3899,24 +3980,36 @@ class H3MultishotMemorySampler:
             # APPENDED LAST: clip-by-clip resumable chaining. Leave chain_id
             # empty and every input above behaves exactly as before - this is
             # opt-in. Set it to render ONE job per shot instead of the whole
-            # chain in one job: the bank, the continuity pin, the colour/gain/
-            # audio-tone running state and the accumulated output are saved to
-            # a chain_multishot_<chain_id>.h3cache file after each job and
-            # picked back up by the next, mirroring the Motion-Context pack's
-            # own disk-cached cross-job continuity.
+            # chain in one job (or a few shots at a time, or the whole chain
+            # in one job but still checkpointed - shots_this_run picks
+            # which). The bank, the continuity pin, the colour/gain/audio-
+            # tone running state and the accumulated output are saved to
+            # disk after every shot and picked back up by the next job:
+            # a small plain-JSON manifest (chain_multishot_<chain_id>.json -
+            # next_shot/n_total/done/master_path, pollable by an external
+            # caller with no torch involved) plus one small state file per
+            # COMPLETED shot, mirroring the Motion-Context Extender pack's
+            # own disk-cached cross-job continuity and its per-clip
+            # validate/redo model.
             "chain_id": ("STRING", {
                 "default": "",
                 "tooltip": "Empty (default) = normal single-job behaviour, "
-                           "unchanged. Non-empty = this chain's continuity "
-                           "state is saved to disk after every job under "
+                           "unchanged. Non-empty = this chain's state is "
+                           "saved to disk after every shot under "
                            "output/video/H3CHAIN_STATE/ and can be resumed "
                            "by a LATER job (resume_chain=True) with the SAME "
                            "chain_id - one ComfyUI job per shot instead of "
-                           "the whole chain in one. script, shot_count, "
-                           "width, height, frames_per_shot, seed, and every "
-                           "continuity-affecting setting must match exactly "
-                           "between jobs of the same chain, or the resume is "
-                           "refused rather than silently rendered wrong."}),
+                           "the whole chain in one, driven by an external "
+                           "caller (e.g. Framesmith) that decides batch vs. "
+                           "clip-by-clip via shots_this_run. width, height, "
+                           "frames_per_shot, shot_count, continuity, and "
+                           "every bank/pin/colour/gain-affecting setting "
+                           "must match exactly between jobs of the same "
+                           "chain, or the resume is refused rather than "
+                           "silently rendered wrong. script/seed are NOT "
+                           "checked - changing either for one job is exactly "
+                           "how you redo a shot with different wording or a "
+                           "different take (see regenerate_from_shot)."}),
             "resume_chain": ("BOOLEAN", {
                 "default": False, "label_on": "resume saved chain state",
                 "label_off": "start fresh (shot 1)",
@@ -3926,20 +4019,36 @@ class H3MultishotMemorySampler:
                            "in-progress chain - use a new chain_id or turn "
                            "this on). ON loads the saved bank/pin/colour/"
                            "gain state and continues from the next "
-                           "unrendered shot. Ignored when chain_id is "
-                           "empty."}),
+                           "unrendered shot (or from regenerate_from_shot, "
+                           "if set). Ignored when chain_id is empty."}),
             "shots_this_run": ("INT", {
                 "default": 0, "min": 0, "max": 64,
                 "tooltip": "With chain_id set: how many shots to render in "
                            "THIS job before saving state and returning - 0 "
                            "(default) renders every remaining shot in one "
-                           "job (same as chain_id off, but still checkpoints "
-                           "to disk after each shot for crash recovery). 1 = "
-                           "true clip-by-clip: one shot per job. The master "
-                           "outputs stay empty/partial until the job that "
-                           "renders the LAST shot, which joins everything "
+                           "job (BATCH mode: same result as chain_id off, "
+                           "but still checkpointed to disk shot-by-shot for "
+                           "crash recovery and external progress polling). "
+                           "1 = true CLIP-BY-CLIP: one shot per job, letting "
+                           "an external caller inspect/reject each shot "
+                           "before the next one renders. The master outputs "
+                           "stay empty/partial until the job that renders "
+                           "the LAST shot, which joins everything "
                            "accumulated so far and returns the finished "
                            "chain. Ignored when chain_id is empty."}),
+            "regenerate_from_shot": ("INT", {
+                "default": 0, "min": 0, "max": 64,
+                "tooltip": "With chain_id set and resume_chain=True: 0 "
+                           "(default) just continues from the next "
+                           "unrendered shot, as normal. N>0 instead REDOES "
+                           "shot N (1-based) and everything after it, "
+                           "discarding their saved state and staged output "
+                           "first - the redo can use a different script "
+                           "paragraph, seed, or reference for that shot; "
+                           "shots before N are untouched. This is how an "
+                           "external caller rejects a shot and tries again "
+                           "without re-rendering the shots already accepted. "
+                           "Refused if shot N has not rendered yet."}),
         },
             # hidden inputs are not widgets, so saved workflows are unaffected
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
@@ -4018,6 +4127,7 @@ class H3MultishotMemorySampler:
             pin_noise_audio=False, audio_tone_control=False,
             x0_texture_clamp=0.0,
             chain_id="", resume_chain=False, shots_this_run=0,
+            regenerate_from_shot=0,
             prompt=None, extra_pnginfo=None):
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
@@ -4061,17 +4171,37 @@ class H3MultishotMemorySampler:
         # honoured. Silent misuse here (a clobbered in-progress chain, or a
         # resume against different settings) does not crash - it produces a
         # chain whose continuity is subtly wrong, discovered only on watch.
+        #
+        # State lives in TWO places per chain, mirroring the Motion-Context
+        # Extender pack's own disk cache: a small plain-JSON manifest
+        # (chain_multishot_<id>.json - next_shot/n_total/done, no tensors,
+        # readable by an external orchestrator without importing torch) plus
+        # one small per-COMPLETED-shot state file
+        # (chain_multishot_<id>_steps/step_%04d.h3state). Keeping one file
+        # per shot instead of a single file that gets overwritten every job
+        # is what makes "redo shot 3, keep 1-2" possible: the state as of
+        # finishing shot 2 is still on disk even after the chain has moved
+        # past it, so a later job can rewind to it on purpose.
         chain_id = str(chain_id or "").strip()
-        _chain_cache_path = None
+        _chain_manifest_path = None
+        _chain_manifest = None
         _chain_saved = None
         _chain_start_si = 0
+        _chain_rewinding = False
         if chain_id:
-            _chain_cache_path = _h3_chain_cache_path(chain_id)
+            _chain_manifest_path = _h3_chain_manifest_path(chain_id)
+            # script/seed/seed_per_shot are DELIBERATELY not fingerprinted:
+            # "reject and regenerate this shot" means changing exactly one
+            # of those for the shot being redone, and a per-shot state file
+            # captures everything the CONTINUITY of the chain actually
+            # depends on independent of the current shot's own wording/seed.
+            # Everything that determines the chain's SHAPE (resolution,
+            # frame count, continuity mode, bank/pin/colour/gain config,
+            # total shot count) still has to match exactly.
             _chain_cfg_fp = _h3_chain_config_fingerprint(
-                script=script, shot_count=shot_count, width=width,
-                height=height, frames_per_shot=frames_per_shot, seed=seed,
-                seed_per_shot=seed_per_shot, memory_frames=memory_frames,
-                anchor_frames=anchor_frames, bank_pinned=bank_pinned,
+                width=width, height=height, frames_per_shot=frames_per_shot,
+                memory_frames=memory_frames, anchor_frames=anchor_frames,
+                bank_pinned=bank_pinned,
                 chain_gain_control=chain_gain_control,
                 bank_clip_frames=bank_clip_frames, continuity=continuity,
                 color_level=color_level, pin_frames=pin_frames,
@@ -4087,54 +4217,100 @@ class H3MultishotMemorySampler:
                 x0_texture_clamp=x0_texture_clamp,
                 self_anchor_voice=self_anchor_voice,
                 reference_subjects=reference_subjects, n_total=n)
-            import os as _os_cc
+            _chain_manifest = _h3_load_manifest(_chain_manifest_path)
             if resume_chain:
-                _chain_saved = _h3_load_chain_state(_chain_cache_path)
-                if _chain_saved is None:
+                if _chain_manifest is None:
                     raise ValueError(
                         "resume_chain=True but chain_id=%r has no saved "
                         "state at %s. Render shot 1 first with "
                         "resume_chain=False, then resume after."
-                        % (chain_id, _chain_cache_path))
-                if _chain_saved.get("config_fp") != _chain_cfg_fp:
+                        % (chain_id, _chain_manifest_path))
+                if _chain_manifest.get("config_fp") != _chain_cfg_fp:
                     raise ValueError(
                         "chain_id=%r's saved state was produced with "
-                        "different settings (script/shot_count/resolution/"
-                        "frames_per_shot/continuity/bank config, or any "
-                        "other continuity-affecting input changed between "
-                        "jobs). Resuming would silently render a chain "
-                        "whose continuity is wrong. Match the original "
-                        "job's settings exactly, or start a new chain_id."
-                        % chain_id)
-                _chain_start_si = int(_chain_saved["next_shot"])
-                if _chain_start_si >= n:
-                    raise ValueError(
-                        "chain_id=%r already rendered all %d shot(s). Use a "
-                        "new chain_id to start another chain."
-                        % (chain_id, n))
-                # loaded on CPU (map_location='cpu'); land the tensors that
-                # actually feed sampling back on the model's own device,
-                # same as they always were within a single job. audio_parts/
-                # lat_v_parts/lat_a_parts/stream_* stay on CPU exactly as the
-                # normal per-job path already keeps them (moving those to
-                # GPU too would pile every past shot's latents into VRAM
-                # right where a long chain can least afford it).
-                _cp_dev = _mm.get_torch_device()
-                for _k in ("bank_entries", "cp_prev", "cc_mu", "cc_cov",
-                          "rp_ref", "at_house", "cg_ref", "cg_last_raw",
-                          "pin_sig0", "pin_hf0", "last_tail", "ho_v", "ho_a",
-                          "ho_taper_src", "ho_guard", "ho_wav_tail",
-                          "house_frame", "voice_block"):
-                    if _k in _chain_saved:
-                        _chain_saved[_k] = _h3_to_device(
-                            _chain_saved[_k], _cp_dev)
-            elif _os_cc.path.exists(_chain_cache_path):
+                        "different settings (resolution/frames_per_shot/"
+                        "continuity/bank config/shot_count, or any other "
+                        "chain-shape input changed between jobs). Resuming "
+                        "would silently render a chain whose continuity is "
+                        "wrong. Match the original job's settings exactly, "
+                        "or start a new chain_id." % chain_id)
+                _chain_saved_next = int(_chain_manifest["next_shot"])
+                _regen = int(regenerate_from_shot or 0)
+                if _regen > 0:
+                    _chain_start_si = _regen - 1
+                    if _chain_start_si < 0 or _chain_start_si >= n:
+                        raise ValueError(
+                            "regenerate_from_shot=%d is out of range for a "
+                            "%d-shot chain (1..%d)." % (_regen, n, n))
+                    if _chain_start_si > _chain_saved_next:
+                        raise ValueError(
+                            "regenerate_from_shot=%d but chain_id=%r has "
+                            "only rendered %d shot(s) so far - nothing to "
+                            "redo there yet." % (_regen, chain_id,
+                                                 _chain_saved_next))
+                    _chain_rewinding = _chain_start_si < _chain_saved_next
+                else:
+                    _chain_start_si = _chain_saved_next
+                    if _chain_start_si >= n:
+                        raise ValueError(
+                            "chain_id=%r already rendered all %d shot(s). "
+                            "Use a new chain_id to start another chain, or "
+                            "set regenerate_from_shot to redo one."
+                            % (chain_id, n))
+                if _chain_start_si > 0:
+                    _chain_saved = _h3_load_chain_state(
+                        _h3_chain_step_path(chain_id, _chain_start_si - 1))
+                    if _chain_saved is None:
+                        raise ValueError(
+                            "chain_id=%r's manifest says shot %d is next, "
+                            "but its state file is missing - the chain's "
+                            "state directory was edited or partially "
+                            "deleted. Start a new chain_id."
+                            % (chain_id, _chain_start_si + 1))
+                    # loaded on CPU (map_location='cpu'); land the tensors
+                    # that actually feed sampling back on the model's own
+                    # device, same as they always were within a single job.
+                    # audio_parts/lat_v_parts/lat_a_parts/stream_* stay on
+                    # CPU exactly as the normal per-job path already keeps
+                    # them (moving those to GPU too would pile every past
+                    # shot's latents into VRAM right where a long chain can
+                    # least afford it).
+                    _cp_dev = _mm.get_torch_device()
+                    for _k in ("bank_entries", "cp_prev", "cc_mu", "cc_cov",
+                              "rp_ref", "at_house", "cg_ref", "cg_last_raw",
+                              "pin_sig0", "pin_hf0", "last_tail", "ho_v",
+                              "ho_a", "ho_taper_src", "ho_guard",
+                              "ho_wav_tail", "house_frame", "voice_block"):
+                        if _k in _chain_saved:
+                            _chain_saved[_k] = _h3_to_device(
+                                _chain_saved[_k], _cp_dev)
+                if _chain_rewinding:
+                    # Commit the rewind NOW, before any sampling: every step
+                    # file and staged clip past this point describes a
+                    # continuation of the shot we are about to replace, so
+                    # it must not be resumable or regenerate-able anymore -
+                    # exactly the Extender pack's own truncate-on-rewrite.
+                    _h3_prune_chain_tail(chain_id, _chain_start_si - 1)
+                    _h3_write_manifest_atomic(_chain_manifest_path, {
+                        "format": "h3_multishot_chain_manifest_v1",
+                        "chain_id": chain_id, "config_fp": _chain_cfg_fp,
+                        "n_total": n, "next_shot": _chain_start_si,
+                        "complete": False,
+                        "stream_dir": _h3_chain_stream_dir(chain_id),
+                        "created_at": _chain_manifest.get("created_at"),
+                        "updated_at": __import__("time").time(),
+                    })
+                    print("[H3Memory] chain_id=%r: regenerating from shot "
+                          "%d - state and staged output for shot %d+ "
+                          "discarded." % (chain_id, _chain_start_si + 1,
+                                         _chain_start_si + 1), flush=True)
+            elif _chain_manifest is not None:
                 raise ValueError(
                     "chain_id=%r already has saved state at %s, and "
                     "resume_chain=False would silently overwrite an "
                     "in-progress chain. Set resume_chain=True to continue "
                     "it, or pick a new chain_id." % (chain_id,
-                                                      _chain_cache_path))
+                                                      _chain_manifest_path))
 
         if sigmas is not None and len(sigmas) > 1:
             # a supplied schedule wins: some turbo LoRAs only converge on the
@@ -4327,8 +4503,6 @@ class H3MultishotMemorySampler:
         # here is a hard error: silently falling back to RAM would produce a
         # chain that looks fine job-to-job and is simply never joined.
         if chain_id and _stream_writer is None:
-            import os
-            import re as _re_cc
             _c_blockers = []
             if str(join_fx or "off") not in ("off", "none", ""):
                 _c_blockers.append("join_fx")
@@ -4342,9 +4516,7 @@ class H3MultishotMemorySampler:
                     "render this chain in one job (chain_id empty)."
                     % (chain_id, "+".join(_c_blockers),
                        "+".join(_c_blockers), "+".join(_c_blockers)))
-            _chain_stream_dir = os.path.join(
-                _h3_chain_cache_dir(),
-                "stream_%s" % _re_cc.sub(r"[^A-Za-z0-9_.-]+", "_", chain_id))
+            _chain_stream_dir = _h3_chain_stream_dir(chain_id)
             _stream_writer = _h3_make_stream_writer(_chain_stream_dir, fps=24)
             print("[H3Memory] chain_id=%r: shots stage to %s across jobs; "
                   "the LAST shot's job joins everything staged so far into "
@@ -6118,12 +6290,30 @@ class H3MultishotMemorySampler:
 
             if chain_id:
                 _chain_last_si_done = si
+                # A step file per COMPLETED shot, not one file for the whole
+                # chain: this is what lets a LATER job rewind to "state as
+                # of finishing shot si" even after the chain has moved past
+                # it (regenerate_from_shot). Pruning here (not just on a
+                # rewind's entry) also cleans up any stale forward files
+                # left behind by a previous, now-superseded attempt at this
+                # same shot.
+                _h3_save_chain_state(_h3_chain_step_path(chain_id, si),
+                                     _chain_snapshot(si + 1))
+                _h3_prune_chain_tail(chain_id, si)
+                _h3_write_manifest_atomic(_chain_manifest_path, {
+                    "format": "h3_multishot_chain_manifest_v1",
+                    "chain_id": chain_id, "config_fp": _chain_cfg_fp,
+                    "n_total": n, "next_shot": si + 1,
+                    "complete": (si + 1 >= n),
+                    "stream_dir": _h3_chain_stream_dir(chain_id),
+                    "created_at": (_chain_manifest or {}).get(
+                        "created_at", __import__("time").time()),
+                    "updated_at": __import__("time").time(),
+                })
                 if si + 1 < n and si + 1 >= _chain_shots_target:
-                    _h3_save_chain_state(_chain_cache_path,
-                                         _chain_snapshot(si + 1))
                     print("[H3Memory] chain_id=%r checkpointed after shot "
                           "%d/%d -> %s" % (chain_id, si + 1, n,
-                                           _chain_cache_path), flush=True)
+                                           _chain_manifest_path), flush=True)
                     _chain_paused = True
                     break
 
@@ -6160,12 +6350,6 @@ class H3MultishotMemorySampler:
             return (_ph, {"waveform": _p_wave, "sample_rate": sr}, _rendered,
                     _chain_batch(_lat_v_parts), _chain_batch(_lat_a_parts),
                     int(_cp_trim), "")
-
-        if chain_id:
-            # the chain finished IN THIS JOB: mark it complete so a stray
-            # future resume_chain=True gets "already rendered all shots"
-            # instead of silently starting over.
-            _h3_save_chain_state(_chain_cache_path, _chain_snapshot(n))
 
         if color_level == "scene" and len(frames_parts) > 1:
             # SCENE-WIDE match: ONE reference for the whole piece, applied
@@ -6245,6 +6429,13 @@ class H3MultishotMemorySampler:
             _stream_writer.finalize(_mpath, master_normalize, waveform, sr,
                                     prompt=_api_prompt,
                                     extra_pnginfo=_api_pnginfo)
+            if chain_id:
+                # last write for this chain: record the finished file's path
+                # in the manifest too, so an external poller sees it without
+                # waiting on this job's own node outputs.
+                _fin_manifest = _h3_load_manifest(_chain_manifest_path) or {}
+                _fin_manifest["master_path"] = _mpath
+                _h3_write_manifest_atomic(_chain_manifest_path, _fin_manifest)
             _ph = torch.zeros((1, _stream_writer.shots[0]["h"],
                                _stream_writer.shots[0]["w"], 3),
                               dtype=torch.half)
